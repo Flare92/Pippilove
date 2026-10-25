@@ -1,0 +1,7 @@
+# Configurazione minima per la Supabase CLI (usata dalla GitHub Action).
+project_id = "pippilove"
+
+[functions.selene]
+# L'identità viene verificata dentro la funzione (auth.getUser):
+# così funziona sia con le chiavi JWT classiche sia con quelle nuove.
+verify_jwt = false

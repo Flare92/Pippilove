@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="theme-color" content="#140a13">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="PippiLove">
+  <title>PippiLove</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,300;1,9..144,400&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="ambient" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+  <canvas id="sparks" aria-hidden="true"></canvas>
+  <main id="app" aria-live="polite">
+    <div class="splash"><div class="orb lg"></div></div>
+  </main>
+  <nav id="tabbar" class="tabbar" hidden>
+    <a href="#/" data-tab="home"><span>✦</span>Oggi</a>
+    <a href="#/selene" data-tab="selene"><span>☾</span>Selene</a>
+    <a href="#/proposte" data-tab="proposte"><span>✉</span>Proposte</a>
+    <a href="#/diario" data-tab="diario"><span>❖</span>Diario</a>
+    <a href="#/impostazioni" data-tab="impostazioni"><span>⋯</span>Altro</a>
+  </nav>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
