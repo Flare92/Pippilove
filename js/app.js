@@ -66,10 +66,16 @@ function greeting() {
 }
 
 // ── configurazione Supabase ───────────────────────────────────
+// tiene solo https://xxxx.supabase.co (toglie /rest/v1/ e simili incollati per errore)
+function cleanUrl(u) {
+  u = String(u || '').trim();
+  if (u && !/^https?:\/\//i.test(u)) u = 'https://' + u;
+  try { return new URL(u).origin; } catch { return u.replace(/\/+$/, ''); }
+}
 function getConfig() {
-  if (SUPABASE_URL && SUPABASE_ANON_KEY) return { url: SUPABASE_URL, key: SUPABASE_ANON_KEY, fromFile: true };
+  if (SUPABASE_URL && SUPABASE_ANON_KEY) return { url: cleanUrl(SUPABASE_URL), key: SUPABASE_ANON_KEY.trim(), fromFile: true };
   const c = store.get('pippilove_config');
-  return c?.url && c?.key ? c : null;
+  return c?.url && c?.key ? { ...c, url: cleanUrl(c.url), key: String(c.key).trim() } : null;
 }
 
 let sb = null;
@@ -882,8 +888,7 @@ const actions = {
 
 const forms = {
   setup: async f => {
-    const url = f.url.value.trim().replace(/\/+$/, '');
-    store.set('pippilove_config', { url, key: f.key.value.trim() });
+    store.set('pippilove_config', { url: cleanUrl(f.url.value), key: f.key.value.trim() });
     location.reload();
   },
   login: async f => {

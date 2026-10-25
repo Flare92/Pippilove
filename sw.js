@@ -1,5 +1,5 @@
 // Service worker: l'app si apre anche offline. I dati passano sempre dalla rete.
-const VERSION = 'pippilove-v2';
+const VERSION = 'pippilove-v3';
 const SHELL = [
   './', 'index.html', 'css/style.css', 'js/app.js', 'js/config.js', 'js/motion.js',
   'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png',
