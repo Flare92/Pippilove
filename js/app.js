@@ -33,11 +33,18 @@ function toast(msg, isErr = false) {
 
 function errMsg(e) {
   const m = e?.message || String(e);
-  if (/Invalid login credentials/i.test(m)) return 'Email o password non corretti';
-  if (/already registered/i.test(m)) return 'Questa email è già registrata: accedi';
+  if (/Invalid login credentials/i.test(m)) return 'Nome o password non corretti';
+  if (/already registered|already been registered/i.test(m)) return 'Questo nome è già registrato: accedi';
   if (/Password should be/i.test(m)) return 'La password deve avere almeno 6 caratteri';
   if (/Failed to fetch|NetworkError|Load failed/i.test(m)) return 'Connessione assente, riprova';
   return m;
+}
+
+// accesso solo con nome + password: l'email è interna e non riceve mai nulla
+function nameToEmail(name) {
+  const slug = String(name || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '.').replace(/^\.+|\.+$/g, '');
+  if (!slug) throw new Error('Scrivi il tuo nome');
+  return `${slug}@pippilove.app`;
 }
 
 async function run(fn, btn) {
@@ -282,8 +289,7 @@ function viewAuth() {
       <button data-act="authTab" data-v="signup" class="${signup ? 'on' : ''}">Registrati</button>
     </div>
     <form class="card stack" data-form="${signup ? 'signup' : 'login'}">
-      ${signup ? `<label class="field"><span>Il tuo nome</span><input type="text" name="name" required autocomplete="given-name"></label>` : ''}
-      <label class="field"><span>Email</span><input type="email" name="email" required autocomplete="email"></label>
+      <label class="field"><span>Il tuo nome</span><input type="text" name="name" required autocomplete="username" autocapitalize="words"></label>
       <label class="field"><span>Password</span><input type="password" name="password" required minlength="6" autocomplete="${signup ? 'new-password' : 'current-password'}"></label>
       <button class="btn block">${signup ? 'Crea account' : 'Entra'}</button>
     </form>
@@ -892,16 +898,16 @@ const forms = {
     location.reload();
   },
   login: async f => {
-    const { error } = await sb.auth.signInWithPassword({ email: f.email.value.trim(), password: f.password.value });
+    const { error } = await sb.auth.signInWithPassword({ email: nameToEmail(f.name.value), password: f.password.value });
     if (error) throw error;
   },
   signup: async f => {
     const { data, error } = await sb.auth.signUp({
-      email: f.email.value.trim(), password: f.password.value,
+      email: nameToEmail(f.name.value), password: f.password.value,
       options: { data: { name: f.name.value.trim() } },
     });
     if (error) throw error;
-    if (!data.session) toast('Ti ho mandato una mail: confermala e poi accedi.');
+    if (!data.session) toast('Su Supabase va spenta la conferma email (vedi README)', true);
   },
   join: async f => {
     const { error } = await sb.rpc('join_couple', { p_code: f.code.value.trim() });
