@@ -17,6 +17,7 @@ const CATS = {
   words: ['💬', 'Parole e fantasie'], places: ['🗝️', 'Tempi e luoghi'], explore: ['🔥', 'Esplorazione'],
 };
 const MIN_INSIGHTS = 4; // come nella funzione Selene
+const MAX_REROLLS = 5;  // come nella funzione Selene
 const store = {
   get: k => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
@@ -435,11 +436,11 @@ function viewHome() {
           ${missionBody(mine, { forGiver: true })}
           ${rr ? `
             <form class="stack" data-form="reroll" data-id="${mine.id}">
-              <textarea name="reason" style="min-height:80px" placeholder="Perché non ti va? (facoltativo, aiuta Selene a capirti)"></textarea>
+              <textarea name="reason" style="min-height:80px" placeholder="Cosa non va? Es. “è un mio desiderio, non suo”, “l’abbiamo già fatto”, “non me la sento”…"></textarea>
               <div class="row"><button type="button" class="btn ghost" data-act="cancelReroll">Annulla</button><button class="btn" style="flex:1">Chiedine un’altra</button></div>
             </form>` : `
             <button class="btn block" data-act="done" data-id="${mine.id}">L’ho fatto ♥</button>
-            ${mine.rerolls < 2 ? `<button class="btn link block" data-act="reroll" data-id="${mine.id}">Non me la sento · cambiala (${2 - mine.rerolls})</button>` : `<p class="faint center">Hai già cambiato missione 2 volte</p>`}`}
+            ${mine.rerolls < MAX_REROLLS ? `<button class="btn link block" data-act="reroll" data-id="${mine.id}">Non va bene · cambiala (${MAX_REROLLS - mine.rerolls})</button>` : `<p class="faint center">Hai già cambiato missione ${MAX_REROLLS} volte questa settimana</p>`}`}
         </div>`);
     } else {
       parts.push(`
@@ -570,7 +571,7 @@ function chatExtras() {
     <div class="idea-card">
       <div class="card-label">✦ Idea di Selene · ${KIND_LABEL()[x.idea.kind]}</div>
       <p class="serif-i">“${esc(x.idea.text)}”</p>
-      ${x.idea.saved ? '<p class="faint">Nella busta segreta ✓</p>' : `<button class="btn small" data-act="saveIdea">Metti nella busta segreta ✉</button>`}
+      ${x.idea.saved ? `<div class="row"><p class="faint" style="flex:1">Nella busta segreta ✓</p><button class="btn link small" data-act="unsaveIdea">Togli dalla busta</button></div>` : `<button class="btn small" data-act="saveIdea">Metti nella busta segreta ✉</button>`}
     </div>` : '';
   return idea + (chips ? `<div class="chips">${chips}</div>` : '');
 }
@@ -691,7 +692,7 @@ function viewProposals() {
         <div>${esc(p.body)}</div>
         <div class="row wrap" style="margin-top:6px"><span class="chip">${kindLabel[p.kind]}</span><span class="chip gold flames">${flames(p.intensity)}</span></div>
       </div>
-      <button class="btn link small" data-act="delProposal" data-id="${p.id}" aria-label="Elimina">✕</button>
+      <button class="btn ghost small del" data-act="delProposal" data-id="${p.id}">Elimina</button>
     </div>`).join('');
 
   return `
@@ -723,7 +724,8 @@ function viewProposals() {
     </form>
     ${secret ? `<div class="item"><div class="ico beat">💌</div><div class="body"><div class="title">${pn} ha ${secret} ${secret === 1 ? 'proposta segreta' : 'proposte segrete'}</div><div class="faint">Le scoprirai quando diventeranno missioni.</div></div></div>` : ''}
     <div class="stack">
-      <h3>Le tue (${S.proposals.length})</h3>
+      <div class="row"><h3 style="flex:1">Le tue (${S.proposals.length})</h3>${S.proposals.length > 1 ? `<button class="btn link small" data-act="delAllProposals">Svuota la busta</button>` : ''}</div>
+      <p class="faint">Ci sono anche le idee che hai salvato dalla chat con Selene. Elimina quelle che non ti rappresentano.</p>
       ${list || '<p class="faint">Nessuna proposta, per ora.</p>'}
     </div>
   </div>`;
@@ -779,7 +781,7 @@ function viewSettings() {
         <li>Ogni giorno, col check-in, legge come state e adatta consigli e tempi.</li>
         <li>Ogni lunedì scrive una missione a testa: una cosa da fare per l’altra persona, pensata su ciò che la accende.</li>
         <li>Chi riceve non sa cosa l’aspetta: lo scopre a missione fatta, e la vota.</li>
-        <li>Se una missione non ti va, cambiala (2 volte a settimana). Il consenso vale sempre.</li>
+        <li>Se una missione non ti va, cambiala (fino a 5 volte a settimana). Il consenso vale sempre.</li>
       </ul>
     </div>
     <div class="card stack">
@@ -787,6 +789,14 @@ function viewSettings() {
       <button class="btn ghost block" data-act="replayIntro">Rivedi l’introduzione</button>
       ${S.partner ? '' : `<p class="small muted">Codice coppia: <b style="color:var(--gold)">${esc(S.couple?.invite_code)}</b></p>`}
     </div>
+    <form class="card stack danger" data-form="resetAll">
+      <h3>Ricomincia da zero con Selene</h3>
+      <p class="faint">Cancella la tua conversazione con Selene, il tuo ritratto e i consigli del giorno. Selene ti conoscerà di nuovo dall’inizio. I dati di ${esc(partnerName())} non vengono toccati.</p>
+      <label class="check"><input type="checkbox" name="proposals"> Svuota anche la mia busta segreta</label>
+      <label class="check"><input type="checkbox" name="checkins"> Cancella anche i miei check-in</label>
+      <label class="check"><input type="checkbox" name="missions"> Togli le missioni di questa settimana non ancora fatte (anche quella di ${esc(partnerName())})</label>
+      <button class="btn ghost block">Ricomincia da zero</button>
+    </form>
     <button class="btn link block" data-act="logout">Esci dall’account</button>
     ${cfg && !cfg.fromFile ? `<button class="btn link block" data-act="resetConfig">Cambia configurazione Supabase</button>` : ''}
   </div>`;
@@ -796,6 +806,16 @@ function viewSettings() {
 const actions = {
   authTab: el => { S.authTab = el.dataset.v; render(); },
   chipSend: el => { if (!S.chatBusy) { haptic(6); sendToSelene(el.dataset.v); } },
+  unsaveIdea: el => run(async () => {
+    const idea = S.chatExtras?.idea;
+    if (!idea?.saved) return;
+    const { error } = await sb.from('proposals').delete().eq('id', idea.saved);
+    if (error) throw error;
+    S.proposals = S.proposals.filter(p => p.id !== idea.saved);
+    idea.saved = false;
+    toast('Tolta dalla busta');
+    render();
+  }, el),
   saveIdea: el => run(async () => {
     const idea = S.chatExtras?.idea;
     if (!idea || idea.saved) return;
@@ -803,7 +823,7 @@ const actions = {
     const { data, error } = await sb.from('proposals').insert(row).select().single();
     if (error) throw error;
     S.proposals.unshift(data);
-    idea.saved = true;
+    idea.saved = data.id;
     const r = el.getBoundingClientRect();
     burst(r.left + r.width / 2, r.top);
     toast('Nella busta segreta ✉');
@@ -900,6 +920,13 @@ const actions = {
   reroll: el => { S.rerollFor = el.dataset.id; render(); },
   cancelReroll: () => { S.rerollFor = null; render(); },
 
+  delAllProposals: el => run(async () => {
+    if (!confirm('Svuotare tutta la tua busta segreta?')) return;
+    const { error } = await sb.from('proposals').delete().eq('author_id', uid());
+    if (error) throw error;
+    S.proposals = [];
+    render();
+  }, el),
   delProposal: el => run(async () => {
     if (!confirm('Eliminare questa proposta?')) return;
     const { error } = await sb.from('proposals').delete().eq('id', el.dataset.id);
@@ -932,6 +959,15 @@ const actions = {
 };
 
 const forms = {
+  resetAll: async f => {
+    if (!confirm('Sei sicuro? Selene dimenticherà tutto quello che le hai raccontato. Non si può annullare.')) return;
+    await selene('reset_all', { options: { proposals: f.proposals.checked, checkins: f.checkins.checked, missions: f.missions.checked } });
+    Object.assign(S, { chat: null, chatExtras: null, chatProgress: null, insights: null, tip: null });
+    await loadAll();
+    toast('Fatto: si riparte da zero ♥');
+    location.hash = '#/selene';
+    render();
+  },
   setup: async f => {
     store.set('pippilove_config', { url: cleanUrl(f.url.value), key: f.key.value.trim() });
     location.reload();

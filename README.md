@@ -4,7 +4,7 @@ Un’app privata per due: esplorare la vostra sessualità con **Selene**, una gu
 
 - **Colloquio con Selene** — domande aperte, una alla volta, che scavano a partire da quello che rispondi. Selene prende appunti (il tuo *ritratto*): li vedi solo tu e puoi cancellarli o escluderli dalle missioni.
 - **Check-in del giorno** — racconti com’è andata, che energia e che voglia hai, cosa vorresti dall’altra persona. Selene adatta il consiglio di oggi (gesto, domanda per la sera, se è il momento giusto per la missione) a come state *entrambi*.
-- **Missioni settimanali** — ogni lunedì Selene scrive una missione a testa: una cosa da fare per l’altra persona, pensata su ciò che la accende. Chi riceve la scopre solo a missione fatta (busta che si apre) e la vota. Se non te la senti, la cambi (2 volte a settimana).
+- **Missioni settimanali** — ogni lunedì Selene scrive una missione a testa: una cosa da fare per l’altra persona, pensata su ciò che la accende. Chi riceve la scopre solo a missione fatta (busta che si apre) e la vota. Se non te la senti, la cambi spiegando cosa non va (fino a 5 volte a settimana).
 - **Busta segreta** — se sai già cosa vorresti, scrivilo: Selene ci costruirà una missione.
 - **Privacy** — colloqui, ritratto e check-in sono leggibili solo da chi li scrive (regole di sicurezza del database). L’AI li usa per ispirare missioni senza mai riportare le parole dell’altra persona.
 

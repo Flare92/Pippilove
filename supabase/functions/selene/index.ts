@@ -32,7 +32,8 @@ const INTERVIEW_DAILY_LIMIT = 150;
 const MIN_INSIGHTS = 4;          // appunti minimi a testa prima della prima missione
 const CONSOLIDATE_OVER = 45;     // oltre questo numero di appunti, Selene li riordina
 const HISTORY = 14;              // messaggi di conversazione inviati all'AI
-const RESUME_HOURS = 3;          // se riapri la chat entro 3 ore, si riprende dall'ultima domanda
+const RESUME_HOURS = 3;
+const MAX_REROLLS = 5;           // cambi di missione a settimana          // se riapri la chat entro 3 ore, si riprende dall'ultima domanda
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { ...CORS, 'Content-Type': 'application/json' } });
@@ -204,10 +205,16 @@ async function loadPerson(ctx: Ctx, id: string): Promise<Person> {
 const partnerLabel = (ctx: Ctx) => (ctx.partner ? ctx.names[ctx.partner] : 'il/la partner');
 
 // Ogni riga porta il nome del proprietario: così l'AI non confonde mai le due persone.
-function notesOf(p: Person, opts: { onlyShareable: boolean; max?: number; topics?: string[] }) {
+function notesOf(p: Person, opts: { onlyShareable: boolean; max?: number; topics?: string[]; perTopic?: number }) {
   const all = p.insights.filter(i => !opts.topics || opts.topics.includes(i.topic));
   const limits = all.filter(i => i.topic === 'limiti');
-  const other = all.filter(i => i.topic !== 'limiti' && (!opts.onlyShareable || i.shareable)).slice(-(opts.max ?? 40));
+  let other = all.filter(i => i.topic !== 'limiti' && (!opts.onlyShareable || i.shareable));
+  if (opts.perTopic) {
+    // solo gli appunti più recenti di ogni argomento: un tema molto raccontato non deve occupare tutto lo spazio
+    const seen: Record<string, number> = {};
+    other = [...other].reverse().filter(i => (seen[i.topic] = (seen[i.topic] || 0) + 1) <= opts.perTopic!).reverse();
+  }
+  other = other.slice(-(opts.max ?? 40));
   const privateLimits = opts.onlyShareable ? limits.filter(i => !i.shareable).length : 0;
   const shownLimits = opts.onlyShareable ? limits.filter(i => i.shareable) : limits;
   return {
@@ -248,6 +255,40 @@ async function myPendingMission(ctx: Ctx) {
 }
 
 const TOPICS = ['desiderio', 'acceleratori', 'freni', 'corpo', 'fantasie', 'limiti', 'comunicazione', 'emozioni', 'storia', 'contesto', 'coppia', 'preferenze'];
+const TOPIC_HINT: Record<string, string> = {
+  desiderio: 'cosa desidera e come nasce il suo desiderio', acceleratori: 'cosa lo/la accende davvero (situazioni, gesti, parole, atmosfere)',
+  freni: 'cosa spegne il desiderio (stress, fretta, pensieri, abitudini)', corpo: 'il rapporto con il proprio corpo e con il tocco',
+  fantasie: 'fantasie e curiosità mai dette', comunicazione: 'come chiede, dice di sì e dice di no',
+  emozioni: 'cosa prova nell’intimità (sicurezza, vulnerabilità, gioco)', storia: 'come ha imparato la sessualità, le prime esperienze di coppia',
+  contesto: 'tempi, luoghi, routine e momenti della settimana', coppia: 'come vive la coppia oggi, cosa le manca, cosa è cambiato',
+  preferenze: 'ritmi, preferenze concrete e piccole cose che fanno la differenza',
+};
+
+// parole significative di un appunto, senza il nome della persona
+function keyWords(s: string, name: string) {
+  const n = name.toLowerCase();
+  return new Set(s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9 ]/g, ' ')
+    .split(/\s+/).filter(w => w.length > 3 && w !== n));
+}
+function similar(a: string, b: string, name: string) {
+  const A = keyWords(a, name), B = keyWords(b, name);
+  if (!A.size || !B.size) return false;
+  let both = 0;
+  for (const w of A) if (B.has(w)) both++;
+  return both / Math.min(A.size, B.size) >= 0.7;
+}
+
+// dove portare la conversazione: argomenti poco esplorati, evitando quelli più battuti di recente
+export function themeGuidance(p: Person, salt = 0) {
+  const recent: Record<string, number> = {};
+  for (const i of p.insights.slice(-8)) if (i.topic !== 'limiti') recent[i.topic] = (recent[i.topic] || 0) + 1;
+  const avoid = Object.entries(recent).filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([t]) => t);
+  const total: Record<string, number> = {};
+  for (const i of p.insights) total[i.topic] = (total[i.topic] || 0) + 1;
+  const candidates = TOPICS.filter(t => t !== 'limiti' && !avoid.includes(t)).sort((a, b) => (total[a] || 0) - (total[b] || 0)).slice(0, 3);
+  const focus = candidates[salt % candidates.length] || 'coppia';
+  return { focus, avoid };
+}
 
 function exploreMap(p: Person) {
   const count: Record<string, number> = {};
@@ -292,6 +333,7 @@ type ChatOut = {
 export function chatSystem(o: {
   me: string; partner: string; mode: 'intro' | 'rientro' | 'risposta'; gap?: string; now: string;
   checkin: string; mission: string; notes: string; limits: string; map: string; lastWasQuestionStreak: number;
+  focus: string; avoid: string[]; alreadyInEnvelope: string[]; pastMissions: string[];
 }) {
   const { me, partner } = o;
   return `${SELENE}
@@ -299,14 +341,25 @@ export function chatSystem(o: {
 STAI PARLANDO CON: ${me}. Dagli/dalle del tu. ${partner} è il/la partner: non è presente in questa chat, non conosci le sue confidenze e non devi mai attribuire a ${me} cose di ${partner}, né inventare cosa pensa o vuole ${partner}. Ogni dato qui sotto è etichettato con il nome della persona a cui si riferisce.
 Ora è ${o.now}.
 
+COME FUNZIONA IL GIOCO (fondamentale)
+- Tu raccogli in privato i desideri di ${me} e li trasformi in sorprese che ${partner} preparerà per ${me}, senza sapere da dove vengono. Allo stesso modo raccogli quelli di ${partner} e li trasformi in missioni per ${me}.
+- Quindi, quando ${me} ti racconta cosa desidera ricevere, sentire o vivere: CUSTODISCILO. Non dirgli/le di farlo da sé, non suggerire di chiederlo a ${partner}, non trasformarlo in qualcosa che ${me} deve fare per ${partner}. Rassicura che lo terrai tu e che diventerà una sorpresa ("questo lo custodisco io…"), e se serve chiedi un dettaglio che lo renda realizzabile (come, quando, con quale intensità, cosa NON deve succedere). In questo caso idea_kind = "receive".
+- Le idee che proponi a ${me} da fare per ${partner} ("give") non possono basarsi su desideri di ${partner}, che non conosci: nascono dalla voglia di ${me} di prendersi cura di ${partner}, dalla missione in corso o da proposte di coppia generiche. Le cose da vivere insieme sono "together".
+
+VARIETÀ (fondamentale)
+- Non fissarti: non tornare di tua iniziativa su temi e idee già trattati. Se è ${me} a riportarli, seguili, altrimenti vai altrove.
+- Temi molto battuti di recente, da NON riprendere tu: ${o.avoid.length ? o.avoid.map(t => `${t} (${TOPIC_HINT[t] || t})`).join('; ') : 'nessuno'}.
+- Tema da aprire oggi se ${me} non porta altro: ${o.focus} — ${TOPIC_HINT[o.focus] || ''}.
+- Ogni idea che proponi dev'essere nuova: diversa da quelle già nella busta e dalle missioni già vissute (elenchi qui sotto), non una loro piccola variante.
+
 COME CONDUCI OGNI RISPOSTA
 1. Prima rispondi davvero a ciò che ${me} ha appena scritto: riprendi una sua parola o immagine precisa e mostra che hai colto anche ciò che sta sotto (emozione, bisogno, timore). Se ti fa una domanda o ti chiede un'idea, rispondi subito e concretamente: non rimandare con un'altra domanda.
 2. Poi scegli UNA mossa:
    a) APPROFONDIRE: una sola domanda aperta e specifica che nasce da ciò che ha detto (un momento preciso, una sensazione nel corpo, cosa cambierebbe, cosa teme);
-   b) PROPORRE: un'idea concreta da vivere con ${partner} stasera o questa settimana, un piccolo esercizio o gioco di coppia, un modo per dire qualcosa a ${partner}, oppure una chiave di lettura da sessuologa applicata al suo caso.
+   b) PROPORRE: un'idea concreta (per stasera o per la settimana: un gesto di cura per ${partner}, un gioco di coppia, un piccolo esercizio per conoscersi meglio, o una chiave di lettura da sessuologa applicata al suo caso), rispettando le regole del gioco qui sopra.
    Alterna le due mosse. ${o.lastWasQuestionStreak >= 2 ? 'Nelle ultime risposte hai fatto solo domande: QUESTA VOLTA PROPONI qualcosa di concreto (puoi chiudere con una domanda breve).' : 'Non fare più di due domande di fila senza proporre qualcosa.'}
 3. Adatta tutto a come sta oggi ${me} (check-in qui sotto): se è stanca/o, stressata/o o giù, proposte di cura, ascolto e contatto senza pressione; se ha energia e voglia, osa di più. Se non c'è il check-in e il momento è giusto, chiedi com'è andata la giornata.
-4. Usa la mappa dell'esplorazione: quando il discorso lo permette, porta con naturalezza verso un'area ancora poco esplorata.
+4. Quando il discorso lo permette, porta con naturalezza verso il tema da aprire oggi.
 Lunghezza: 2-6 frasi. Più lungo solo se ti chiede un'idea o una spiegazione. Niente elenchi lunghi.
 
 ${o.mode === 'intro' ? `PRIMO INCONTRO: presentati in 2-3 frasi, spiega che quello che ${me} ti dice resta riservato (lo userai per ispirare sorprese e missioni, senza mai riportare le sue parole a ${partner}; può dirti "questo tienilo per te") e fai una prima domanda leggera, legata a come sta oggi.` : ''}${o.mode === 'rientro' ? `${me} RIAPRE LA CHAT dopo ${o.gap}. Non ripetere l'ultima domanda: saluta in modo adatto al momento della giornata, riallacciati a com'è oggi (check-in, se c'è, altrimenti chiedi com'è andata) o alla missione in corso, e offri subito qualcosa: una piccola idea per oggi o una domanda nuova. Se c'era un filo rimasto in sospeso puoi richiamarlo in una frase.` : ''}
@@ -315,7 +368,7 @@ CAMPI DA COMPILARE
 - reply: il tuo messaggio a ${me}.
 - suggestions: esattamente 3 risposte brevi (massimo 6 parole) che ${me} potrebbe toccare per continuare, scritte da ${me} in prima persona: una per approfondire, una per chiederti un'idea, una per parlare di oggi o cambiare argomento.
 - idea_text / idea_kind / idea_intensity: se nella reply proponi un'idea concreta che potrebbe diventare una missione, riscrivila qui in una frase in prima persona di ${me} (es. "Vorrei che mi preparassi un bagno caldo e restassi con me"). idea_kind: receive = ${partner} la fa per ${me}; give = ${me} la fa per ${partner}; together = insieme. idea_intensity: 1 dolce, 2 audace, 3 molto audace. L'app mostrerà un pulsante per metterla nella busta segreta. Se non proponi nulla: idea_text "", idea_kind "none", idea_intensity 1.
-- new_insights: SOLO informazioni nuove su ${me} emerse dal suo ultimo messaggio (spesso 0-3). Ogni nota inizia con il nome "${me}" (es. "${me} si accende quando…"). Se ${me} racconta qualcosa di ${partner}, scrivi "${me} percepisce che ${partner}…", mai come un fatto su ${partner}. topic "limiti" per ciò che non vuole fare o ricevere. shareable false se ${me} ha chiesto di tenerlo per sé o è troppo delicato per ispirare missioni.
+- new_insights: SOLO informazioni nuove su ${me} emerse dal suo ultimo messaggio (spesso 0-3). Ogni nota inizia con il nome "${me}" (es. "${me} si accende quando…"). Se ${me} racconta qualcosa di ${partner}, scrivi "${me} percepisce che ${partner}…", mai come un fatto su ${partner}. Quando ${me} esprime un desiderio verso ${partner}, scrivi la nota come "${me} vorrebbe che ${partner}…" (topic desiderio): servirà per le missioni di ${partner}. Non ripetere appunti già presenti in "COSA SAI GIÀ". topic "limiti" per ciò che non vuole fare o ricevere. shareable false se ${me} ha chiesto di tenerlo per sé o è troppo delicato per ispirare missioni.
 - progress: quanto senti di conoscere ${me}, da 0 a 100.
 
 MAPPA DELL'ESPLORAZIONE DI ${me.toUpperCase()}
@@ -326,6 +379,12 @@ ${o.checkin}
 
 MISSIONE CHE ${me.toUpperCase()} STA FACENDO PER ${partner.toUpperCase()} QUESTA SETTIMANA
 ${o.mission}
+
+IDEE GIÀ NELLA BUSTA SEGRETA DI ${me.toUpperCase()} (non riproporle)
+${o.alreadyInEnvelope.map(x => '- ' + x).join('\n') || '—'}
+
+MISSIONI GIÀ VISSUTE (non riproporle)
+${o.pastMissions.map(x => '- ' + x).join('\n') || '—'}
 
 LIMITI DI ${me.toUpperCase()}
 ${o.limits || '— nessuno dichiarato'}
@@ -363,8 +422,19 @@ export async function interview(ctx: Ctx, message: string | undefined) {
 
   const meP = await loadPerson(ctx, me);
   const partner = partnerLabel(ctx);
-  const { notes, limits } = notesOf(meP, { onlyShareable: false, max: 40 });
-  const mission = await myPendingMission(ctx);
+  const { notes, limits } = notesOf(meP, { onlyShareable: false, max: 36, perTopic: 4 });
+  const [mission, myProps, past] = await Promise.all([
+    myPendingMission(ctx),
+    db.from('proposals').select('body').eq('author_id', me).order('created_at', { ascending: false }).limit(12),
+    ctx.couple
+      ? db.from('challenges').select('ai_title, giver_id, receiver_id, status').eq('couple_id', ctx.couple).order('week_start', { ascending: false }).limit(10)
+      : Promise.resolve({ data: [] as { ai_title: string; giver_id: string; receiver_id: string; status: string }[] }),
+  ]);
+  // le missioni che ${me} riceve e non ha ancora scoperto restano segrete anche per la chat
+  const pastMissions = ((past.data || []) as { ai_title: string; giver_id: string; receiver_id: string; status: string }[])
+    .filter(c => c.ai_title && (c.status === 'done' || c.giver_id === me))
+    .map(c => `"${c.ai_title}" (${ctx.names[c.giver_id]} per ${ctx.names[c.receiver_id]})`);
+  const theme = themeGuidance(meP, history.length + new Date().getDate());
   // quante risposte consecutive di Selene finivano con una domanda
   let streak = 0;
   for (let i = history.length - 1; i >= 0 && streak < 3; i--) {
@@ -377,6 +447,8 @@ export async function interview(ctx: Ctx, message: string | undefined) {
     checkin: checkinOwn(meP, todayOf(meP)).replaceAll('{PARTNER}', partner),
     mission: mission ? `"${mission.ai_title}": ${mission.ai_text}` : 'nessuna missione in corso',
     notes, limits, map: exploreMap(meP), lastWasQuestionStreak: streak,
+    focus: theme.focus, avoid: theme.avoid,
+    alreadyInEnvelope: ((myProps.data || []) as { body: string }[]).map(p => clip(p.body, 140)), pastMissions,
   });
 
   const msgs: Msg[] = history.map(h => ({ role: h.role, content: clip(h.content, 1500) }));
@@ -388,12 +460,16 @@ export async function interview(ctx: Ctx, message: string | undefined) {
   if (!reply) throw new HttpError(502, 'Selene si è persa un attimo, riprova');
 
   await db.from('interview_messages').insert({ user_id: me, role: 'assistant', content: reply });
-  const fresh = text
-    ? (Array.isArray(out.new_insights) ? out.new_insights : [])
-      .filter(i => i && str(i.note))
-      .slice(0, 5)
-      .map(i => ({ user_id: me, topic: TOPICS.includes(i.topic) ? i.topic : 'preferenze', note: clip(str(i.note), 400), shareable: i.shareable !== false, source: 'interview' }))
-    : [];
+  const fresh: { user_id: string; topic: string; note: string; shareable: boolean; source: string }[] = [];
+  if (text) {
+    for (const i of (Array.isArray(out.new_insights) ? out.new_insights : []).slice(0, 5)) {
+      const note = clip(str(i?.note), 400);
+      if (!note) continue;
+      // niente doppioni: se Selene sa già la stessa cosa, non la riscrive
+      if ([...meP.insights.map(x => x.note), ...fresh.map(x => x.note)].some(n => similar(n, note, meP.name))) continue;
+      fresh.push({ user_id: me, topic: TOPICS.includes(i.topic) ? i.topic : 'preferenze', note, shareable: i.shareable !== false, source: 'interview' });
+    }
+  }
   if (fresh.length) await db.from('insights').insert(fresh);
 
   if (meP.insights.length + fresh.length > CONSOLIDATE_OVER) {
@@ -460,12 +536,22 @@ const MISSION_SCHEMA = {
 type Mission = { chi_la_fa?: string; per_chi?: string; title: string; mission: string; why: string; category: string; intensity: number; proposal_id: string | null };
 type Proposal = { id: string; author_id: string; kind: string; body: string; intensity: number };
 
+const CATEGORIES: Record<string, string> = {
+  romance: 'romanticismo', touch: 'tocco e sensi', tease: 'seduzione e gioco', words: 'parole e fantasie', places: 'tempi e luoghi', explore: 'esplorazione',
+};
+export function pickCategory(recent: string[]) {
+  const last2 = recent.slice(0, 2);
+  const count: Record<string, number> = {};
+  for (const c of recent.slice(0, 8)) count[c] = (count[c] || 0) + 1;
+  return Object.keys(CATEGORIES).filter(c => !last2.includes(c)).sort((a, b) => (count[a] || 0) - (count[b] || 0))[0] || 'romance';
+}
+
 export function missionPrompt(o: {
   giver: Person; receiver: Person; week: string; level: number; safeWord: string | null;
-  proposals: Proposal[]; history: string[]; extra: string;
+  proposals: Proposal[]; history: string[]; extra: string; category?: string; recentCategories?: string[];
 }) {
   const G = o.giver.name, R = o.receiver.name;
-  const recv = notesOf(o.receiver, { onlyShareable: true, max: 40 });
+  const recv = notesOf(o.receiver, { onlyShareable: true, max: 32, perTopic: 4 });
   // di chi fa la missione servono solo limiti, energie e ciò che si è offerto di fare: NON i suoi desideri
   const giv = notesOf(o.giver, { onlyShareable: true, max: 12, topics: ['limiti', 'comunicazione', 'contesto'] });
   const recvWishes = o.receiver.checkins.filter(c => c.wish).slice(0, 3).map(c => `- ${c.day}: ${R} vorrebbe ricevere da ${G}: "${clip(c.wish!, 200)}"`);
@@ -485,7 +571,10 @@ COMPITO: scrivi UNA missione settimanale.
 Attenzione a non invertire i ruoli: i desideri da soddisfare sono quelli di ${R}, non quelli di ${G}.
 
 Regole:
-- Basati su "COSA ACCENDE ${R.toUpperCase()}" e su ciò che ${R} vorrebbe ricevere. Di ${G} considera solo limiti ed energie, per proporre qualcosa che ${G} possa fare volentieri.
+- Il cuore del tuo lavoro: prendi i desideri di ${R} (gli appunti "${R} vorrebbe che ${G}…", ciò che accende ${R}, le proposte in cui ${R} vuole ricevere, i desideri dei check-in) e TRASFORMALI in un'azione concreta che ${G} compie per ${R}. ${G} non deve capire che viene da una confidenza: scrivila come un'idea di Selene.
+- Di ${G} considera solo limiti ed energie, per proporre qualcosa che ${G} possa fare volentieri.
+- Categoria di questa settimana: ${o.category ? `${o.category} (${CATEGORIES[o.category]})` : 'libera'}. Scegline un'altra solo se non c'è proprio materiale adatto. ${o.recentCategories?.length ? `Ultime categorie usate: ${o.recentCategories.slice(0, 4).join(', ')}.` : ''}
+- Non fissarti su un solo desiderio: se uno è già stato usato in una missione recente (storico qui sotto), parti da un altro.
 - MAI nulla che tocchi i limiti di ${R} o di ${G}.
 - Livello attuale della coppia: ${o.level}/3. Scendi se i check-in recenti raccontano stanchezza o stress; sali solo se entrambi sembrano pronti.
 - Concreta, realizzabile in una settimana, originale e personale. Varia rispetto alle ultime settimane; riprendi lo spirito di ciò che ha preso voti alti, evita ciò che ha preso voti bassi.
@@ -527,7 +616,7 @@ async function createMission(ctx: Ctx, week: string, giverId: string, receiverId
     loadPerson(ctx, giverId),
     loadPerson(ctx, receiverId),
     db.from('proposals').select('id, author_id, kind, body, intensity').eq('couple_id', ctx.couple!),
-    db.from('challenges').select('week_start, giver_id, receiver_id, ai_title, proposal_id, status, rating, feedback')
+    db.from('challenges').select('week_start, giver_id, receiver_id, ai_title, ai_category, proposal_id, status, rating, feedback')
       .eq('couple_id', ctx.couple!).order('week_start', { ascending: false }).limit(16),
   ]);
   const used = new Set((hist.data || []).filter(h => h.proposal_id && (h.status === 'done' || h.week_start === week)).map(h => h.proposal_id));
@@ -538,7 +627,9 @@ async function createMission(ctx: Ctx, week: string, giverId: string, receiverId
   const history = (hist.data || []).map(h =>
     `- ${h.week_start} · ${ctx.names[h.giver_id]} per ${ctx.names[h.receiver_id]}: "${h.ai_title || 'missione'}" — ${h.status === 'done' ? 'fatta' : 'in corso'}${h.rating ? `, voto di ${ctx.names[h.receiver_id]}: ${h.rating}/5` : ''}${h.feedback ? `, commento: "${clip(h.feedback, 160)}"` : ''}`);
 
-  const { system, user } = missionPrompt({ giver, receiver, week, level, safeWord: ctx.safeWord, proposals: eligible, history, extra });
+  const recentCategories = (hist.data || []).filter(h => h.week_start !== week && h.ai_category).map(h => h.ai_category as string);
+  const category = pickCategory(recentCategories);
+  const { system, user } = missionPrompt({ giver, receiver, week, level, safeWord: ctx.safeWord, proposals: eligible, history, extra, category, recentCategories });
   let m = await ai<Mission>(system, [{ role: 'user', content: user }], MISSION_SCHEMA, { maxTokens: 1500, effort: 'medium' });
   // controllo dei ruoli: se l'AI li ha invertiti, si riprova una volta
   const swapped = (x: Mission) => str(x.per_chi).toLowerCase() === giver.name.toLowerCase() || str(x.chi_la_fa).toLowerCase() === receiver.name.toLowerCase();
@@ -590,7 +681,7 @@ export async function draw(ctx: Ctx) {
 export async function reroll(ctx: Ctx, challengeId: string, reason: string | undefined) {
   const { data: ch } = await ctx.db.from('challenges').select('*').eq('id', challengeId).single();
   if (!ch || ch.giver_id !== ctx.me || ch.status !== 'pending') throw new HttpError(404, 'Missione non trovata');
-  if (ch.rerolls >= 2) throw new HttpError(400, 'Hai già cambiato missione 2 volte questa settimana');
+  if (ch.rerolls >= MAX_REROLLS) throw new HttpError(400, `Hai già cambiato missione ${MAX_REROLLS} volte questa settimana`);
   const reasons = [...(ch.reroll_reasons || []), `"${ch.ai_title}" — ${reason?.trim() || 'non se la sente'}`];
   const extra = `\nMISSIONI GIÀ SCARTATE QUESTA SETTIMANA DA ${ctx.names[ctx.me]} (proponi qualcosa di diverso, tenendo conto del motivo):\n${reasons.map(r => '- ' + r).join('\n')}\n`;
   const m = await createMission(ctx, ch.week_start, ch.giver_id, ch.receiver_id, extra);
@@ -619,10 +710,10 @@ const TODAY_SCHEMA = {
   additionalProperties: false,
 };
 
-export function todayPrompt(o: { me: Person; partner: Person | null; mineToday: Checkin; theirsToday?: Checkin; mission: string; now: string }) {
+export function todayPrompt(o: { me: Person; partner: Person | null; mineToday: Checkin; theirsToday?: Checkin; mission: string; now: string; pastTips?: string[] }) {
   const M = o.me.name, P = o.partner?.name || 'il/la partner';
-  const mine = notesOf(o.me, { onlyShareable: false, max: 25 });
-  const theirs = o.partner ? notesOf(o.partner, { onlyShareable: true, max: 20 }) : { notes: '', limits: '' };
+  const mine = notesOf(o.me, { onlyShareable: false, max: 20, perTopic: 3 });
+  const theirs = o.partner ? notesOf(o.partner, { onlyShareable: true, max: 20, perTopic: 3 }) : { notes: '', limits: '' };
   const system = `${SELENE}
 
 Scrivi il consiglio di oggi PER ${M} (dagli/dalle del tu). ${P} è il/la partner.
@@ -651,7 +742,10 @@ Cosa accende ${P}:
 ${theirs.notes || '—'}
 
 MISSIONE CHE ${M.toUpperCase()} STA FACENDO PER ${P.toUpperCase()}:
-${o.mission}`;
+${o.mission}
+
+GESTI E DOMANDE GIÀ SUGGERITI NEI GIORNI SCORSI (non ripeterli, proponi altro):
+${o.pastTips?.map(t => '- ' + t).join('\n') || '—'}`;
   return { system, user };
 }
 
@@ -670,13 +764,16 @@ export async function today(ctx: Ctx, force: boolean) {
     if (cached && cached.basis === basis) return cached.content;
   }
 
-  const [meP, partnerP, mission] = await Promise.all([
+  const [meP, partnerP, mission, prevTips] = await Promise.all([
     loadPerson(ctx, me),
     partner ? loadPerson(ctx, partner) : Promise.resolve(null),
     myPendingMission(ctx),
+    db.from('daily_tips').select('day, content').eq('user_id', me).neq('day', day).order('day', { ascending: false }).limit(4),
   ]);
+  const pastTips = ((prevTips.data || []) as { content: { gesture?: string; question?: string } }[])
+    .flatMap(t => [t.content?.gesture, t.content?.question]).filter(Boolean).map(x => clip(String(x), 160));
   const { system, user } = todayPrompt({
-    me: meP, partner: partnerP, mineToday, theirsToday, now: romeNow(),
+    me: meP, partner: partnerP, mineToday, theirsToday, now: romeNow(), pastTips,
     mission: mission ? `"${mission.ai_title}": ${mission.ai_text}` : 'nessuna in corso',
   });
 
@@ -688,6 +785,22 @@ export async function today(ctx: Ctx, force: boolean) {
   };
   await db.from('daily_tips').upsert({ user_id: me, day, content: clean, basis });
   return clean;
+}
+
+// ── ripartire da zero ───────────────────────────────────────────
+export async function resetAll(ctx: Ctx, opts: { proposals?: boolean; checkins?: boolean; missions?: boolean }) {
+  const { db, me } = ctx;
+  await db.from('interview_messages').delete().eq('user_id', me);
+  await db.from('insights').delete().eq('user_id', me);
+  await db.from('daily_tips').delete().eq('user_id', me);
+  if (opts.proposals) await db.from('proposals').delete().eq('author_id', me);
+  if (opts.checkins) await db.from('checkins').delete().eq('user_id', me);
+  if (opts.missions && ctx.couple) {
+    const week = await currentWeek(db);
+    // le missioni di questa settimana non ancora fatte erano basate sui vecchi dati: si tolgono (per entrambi)
+    await db.from('challenges').delete().eq('couple_id', ctx.couple).eq('week_start', week).eq('status', 'pending');
+  }
+  return { ok: true };
 }
 
 // ── server ──────────────────────────────────────────────────────
@@ -704,6 +817,7 @@ if (!Deno.env.get('PIPPI_TEST')) Deno.serve(async (req) => {
 
     switch (body.action) {
       case 'interview': return json(await interview(ctx, body.message));
+      case 'reset_all': return json(await resetAll(ctx, body.options || {}));
       case 'interview_reset': {
         await db.from('interview_messages').delete().eq('user_id', user.id);
         return json({ ok: true });
