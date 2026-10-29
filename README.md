@@ -21,7 +21,8 @@ Tecnica: PWA (HTML/CSS/JS senza build) su GitHub Pages · database e login su Su
 4. Dal tuo account Supabase: *Account → Access Tokens → Generate new token* (serve a GitHub per pubblicare database e funzione).
 
 ### 2. Chiave AI gratuita (Groq)
-Crea una chiave su [console.groq.com/keys](https://console.groq.com/keys). Il piano gratuito basta e avanza per due persone.
+Crea una chiave su [console.groq.com/keys](https://console.groq.com/keys). Il piano gratuito basta per due persone.
+Selene prova da sola, in ordine, `openai/gpt-oss-120b` → `qwen/qwen3.8-27b` → `openai/gpt-oss-20b`: se un modello non è disponibile per il tuo account o ha finito la quota del giorno, passa al successivo. Con il segreto `AI_MODEL` puoi indicarne uno da provare per primo.
 
 > Vuoi usare Claude (più bravo, a consumo, pochi centesimi al mese con Haiku)? Metti la chiave di [platform.claude.com](https://platform.claude.com) in `AI_API_KEY` e la variabile `AI_PROVIDER = anthropic`.
 

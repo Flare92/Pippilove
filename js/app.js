@@ -86,14 +86,15 @@ function getConfig() {
 }
 
 let sb = null;
-const S = {
+const freshState = () => ({
   session: null, profile: null, couple: null, partner: null,
   myInsights: 0, proposals: [], challenges: [],
   checkin: null, tip: null, tipLoading: false, drawing: false, drawBlocked: null,
-  chat: null, chatSeen: 0, chatBusy: false, chatProgress: null, insights: null,
+  chat: null, chatSeen: 0, chatBusy: false, chatProgress: null, insights: null, chatExtras: null, chatOwner: null,
   loaded: false, authTab: 'login', checkinDraft: null, ckStep: 0, ckDir: 'in',
   rerollFor: null,
-};
+});
+const S = freshState();
 const uid = () => S.session?.user?.id;
 const myName = () => S.profile?.display_name || 'tu';
 const partnerName = () => S.partner?.name || 'il/la partner';
@@ -545,16 +546,33 @@ function grabCheckinText() {
 
 // ── vista: Selene ────────────────────────────────────────────
 async function loadChat() {
-  S.chat = [];
-  const { data } = await sb.from('interview_messages').select('role,content').eq('user_id', uid()).order('id').limit(300);
+  const owner = uid();
+  S.chat = []; S.chatOwner = owner;
+  const { data } = await sb.from('interview_messages').select('role,content,created_at').eq('user_id', owner).order('id').limit(300);
+  if (uid() !== owner) return;
   S.chat = data || [];
   render();
-  if (!S.chat.length || S.chat[S.chat.length - 1].role === 'user') sendToSelene('');
+  sendToSelene(''); // Selene riprende il filo, o se è passato del tempo ti scrive lei per prima
 }
 
 function wordsAnimated(text) {
   let i = 0;
   return esc(text).split(/(\s+)/).map(tok => /^\s+$/.test(tok) ? tok : `<span class="w" style="animation-delay:${Math.min(i++ * 45, 6000)}ms">${tok}</span>`).join('');
+}
+
+const KIND_LABEL = () => ({ receive: `${esc(partnerName())} per te`, give: `Tu per ${esc(partnerName())}`, together: 'Insieme' });
+
+function chatExtras() {
+  const x = S.chatExtras;
+  if (!x || S.chatBusy) return '';
+  const chips = (x.suggestions || []).map(t => `<button type="button" class="chip-btn" data-act="chipSend" data-v="${esc(t)}">${esc(t)}</button>`).join('');
+  const idea = x.idea ? `
+    <div class="idea-card">
+      <div class="card-label">✦ Idea di Selene · ${KIND_LABEL()[x.idea.kind]}</div>
+      <p class="serif-i">“${esc(x.idea.text)}”</p>
+      ${x.idea.saved ? '<p class="faint">Nella busta segreta ✓</p>' : `<button class="btn small" data-act="saveIdea">Metti nella busta segreta ✉</button>`}
+    </div>` : '';
+  return idea + (chips ? `<div class="chips">${chips}</div>` : '');
 }
 
 function viewSelene() {
@@ -567,13 +585,15 @@ function viewSelene() {
       <div class="orb ${S.chatBusy ? 'thinking' : ''}"></div>
       <div style="flex:1">
         <h2>Selene</h2>
-        <p class="faint">Colloquio privato${S.chatProgress != null ? ` · ti conosco al ${S.chatProgress}%` : ''}</p>
+        <p class="faint">In privato con ${esc(myName())}${S.chatProgress != null ? ` · ${S.chatProgress}%` : ''}</p>
       </div>
       <a class="btn ghost small" href="#/ritratto">Il tuo ritratto</a>
     </div>
     <div class="chat">
       ${msgs.map((m, i) => `<div class="bubble ${m.role === 'user' ? 'me' : 'sel'}${i < S.chatSeen ? ' still' : ''}">${m.role === 'assistant' && i === lastIdx && m.fresh && i >= S.chatSeen ? wordsAnimated(m.content) : esc(m.content)}</div>${m.learned ? `<div class="learned">✦ Selene ha preso nota</div>` : ''}`).join('')}
       ${S.chatBusy ? `<div class="bubble sel typing"><i></i><i></i><i></i></div>` : ''}
+      ${chatExtras()}
+      ${!S.chatBusy && !S.checkin && msgs.length ? `<a class="checkin-nudge" href="#/checkin">☾ Non hai ancora raccontato com’è andata oggi · <b>fai il check-in</b></a>` : ''}
       ${msgs.length > 2 ? '' : `<p class="faint center" style="margin-top:6px">Puoi dire “questo tienilo per te”: Selene non lo userà nelle missioni.</p>`}
       <div id="chatEnd"></div>
     </div>
@@ -585,14 +605,19 @@ function viewSelene() {
 }
 
 async function sendToSelene(text) {
+  const owner = uid();
   if (text) S.chat.push({ role: 'user', content: text });
-  S.chatBusy = true; render();
+  S.chatBusy = true; S.chatExtras = text ? null : S.chatExtras; render();
   try {
     const r = await selene('interview', { message: text });
+    if (uid() !== owner) return; // nel frattempo è cambiato account
     if (!r.resumed) {
       if (text && r.learned) S.chat[S.chat.length - 1].learned = true;
       S.chat.push({ role: 'assistant', content: r.reply, fresh: true });
+      S.chatExtras = { suggestions: r.suggestions || [], idea: r.idea || null };
       haptic(8);
+    } else if (!S.chatExtras) {
+      S.chatExtras = { suggestions: ['Dammi un’idea per stasera', 'Ti racconto com’è andata oggi', 'Facciamo un gioco'], idea: null };
     }
     if (r.progress != null) S.chatProgress = r.progress;
     if (r.learned) {
@@ -770,6 +795,20 @@ function viewSettings() {
 // ── azioni ───────────────────────────────────────────────────
 const actions = {
   authTab: el => { S.authTab = el.dataset.v; render(); },
+  chipSend: el => { if (!S.chatBusy) { haptic(6); sendToSelene(el.dataset.v); } },
+  saveIdea: el => run(async () => {
+    const idea = S.chatExtras?.idea;
+    if (!idea || idea.saved) return;
+    const row = { couple_id: S.couple.id, author_id: uid(), kind: idea.kind, body: idea.text.slice(0, 500), intensity: idea.intensity || 1 };
+    const { data, error } = await sb.from('proposals').insert(row).select().single();
+    if (error) throw error;
+    S.proposals.unshift(data);
+    idea.saved = true;
+    const r = el.getBoundingClientRect();
+    burst(r.left + r.width / 2, r.top);
+    toast('Nella busta segreta ✉');
+    render();
+  }, el),
   logout: async () => { await sb.auth.signOut(); },
   resetConfig: () => { localStorage.removeItem('pippilove_config'); location.reload(); },
 
@@ -997,7 +1036,9 @@ async function boot() {
     const changed = session?.user?.id !== S.session?.user?.id;
     S.session = session;
     if (!changed) return;
-    Object.assign(S, { loaded: false, chat: null, insights: null, tip: null, checkin: null });
+    // nuovo account (anche sullo stesso telefono): si riparte da zero, nulla dell'altra persona resta in memoria
+    Object.assign(S, freshState(), { session, authTab: S.authTab });
+    applyMood();
     render();
     if (session) await run(loadAll);
     render();

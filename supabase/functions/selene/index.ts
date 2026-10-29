@@ -5,7 +5,8 @@
 // Segreti (Supabase → Edge Functions → Secrets):
 //   AI_API_KEY    chiave del fornitore AI (obbligatoria)
 //   AI_PROVIDER   'groq' (predefinito, gratuito) · 'anthropic' (Claude) · 'openai' (qualsiasi API compatibile)
-//   AI_MODEL      facoltativo; predefiniti: groq → llama-3.3-70b-versatile, anthropic → claude-haiku-5-5
+//   AI_MODEL      facoltativo: modello preferito. Se non è disponibile o ha finito la quota,
+//                 Selene passa da sola al successivo della lista MODELS qui sotto.
 //   AI_BASE_URL   solo per 'openai': indirizzo base compatibile (es. https://openrouter.ai/api/v1)
 // SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY sono già presenti in automatico.
 
@@ -18,11 +19,20 @@ const CORS = {
 };
 const PROVIDER = (Deno.env.get('AI_PROVIDER') || 'groq').toLowerCase();
 const API_KEY = Deno.env.get('AI_API_KEY') || Deno.env.get('GROQ_API_KEY') || Deno.env.get('ANTHROPIC_API_KEY') || '';
-const MODEL = Deno.env.get('AI_MODEL') || (PROVIDER === 'anthropic' ? 'claude-haiku-5-5' : 'llama-3.3-70b-versatile');
 const BASE_URL = (Deno.env.get('AI_BASE_URL') || 'https://api.groq.com/openai/v1').replace(/\/+$/, '');
+// Groq gratuito: ogni modello ha la sua quota giornaliera, quindi a quota finita si passa al successivo.
+const DEFAULT_MODELS: Record<string, string[]> = {
+  groq: ['openai/gpt-oss-120b', 'qwen/qwen3.8-27b', 'openai/gpt-oss-20b', 'llama-3.3-70b-versatile'],
+  anthropic: ['claude-haiku-5-5', 'claude-sonnet-5-5'],
+  openai: [],
+};
+const MODELS = [...new Set([Deno.env.get('AI_MODEL') || '', ...(DEFAULT_MODELS[PROVIDER] || [])].filter(Boolean))];
+const STRICT_SCHEMA = /^(openai\/gpt-oss|qwen\/qwen3)/; // modelli Groq con output JSON garantito dallo schema
 const INTERVIEW_DAILY_LIMIT = 150;
 const MIN_INSIGHTS = 4;          // appunti minimi a testa prima della prima missione
-const CONSOLIDATE_OVER = 60;     // oltre questo numero di appunti, Selene li riordina
+const CONSOLIDATE_OVER = 45;     // oltre questo numero di appunti, Selene li riordina
+const HISTORY = 14;              // messaggi di conversazione inviati all'AI
+const RESUME_HOURS = 3;          // se riapri la chat entro 3 ore, si riprende dall'ultima domanda
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { ...CORS, 'Content-Type': 'application/json' } });
@@ -32,6 +42,10 @@ class HttpError extends Error { constructor(public status: number, msg: string) 
 // ── AI ──────────────────────────────────────────────────────────
 type Msg = { role: 'user' | 'assistant'; content: string };
 type Schema = Record<string, unknown>;
+type Effort = 'low' | 'medium';
+type CallResult = { status: number; text?: string; error?: string };
+
+const unavailable = new Set<string>(); // modelli non accessibili con questa chiave (per la vita del processo)
 
 function normalise(messages: Msg[]): Msg[] {
   // ruoli alternati, si parte da "user"
@@ -41,7 +55,7 @@ function normalise(messages: Msg[]): Msg[] {
     if (last && last.role === m.role) last.content += '\n\n' + m.content;
     else merged.push({ ...m });
   }
-  if (!merged.length || merged[0].role !== 'user') merged.unshift({ role: 'user', content: '(inizio)' });
+  if (!merged.length || merged[0].role !== 'user') merged.unshift({ role: 'user', content: '(inizio della conversazione)' });
   return merged;
 }
 
@@ -53,12 +67,12 @@ function parseJson(text: string): unknown {
   throw new Error('JSON non valido');
 }
 
-async function callAnthropic(system: string, messages: Msg[], schema: Schema, maxTokens: number, effort: string) {
+async function callAnthropic(model: string, system: string, messages: Msg[], schema: Schema, maxTokens: number, effort: Effort): Promise<CallResult> {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
     body: JSON.stringify({
-      model: MODEL, max_tokens: maxTokens, system, messages,
+      model, max_tokens: maxTokens + 2000, system, messages,
       output_config: { effort, format: { type: 'json_schema', schema } },
     }),
   });
@@ -69,57 +83,89 @@ async function callAnthropic(system: string, messages: Msg[], schema: Schema, ma
   return { status: 200, text };
 }
 
-async function callOpenAICompat(system: string, messages: Msg[], schema: Schema, maxTokens: number) {
-  const sys = `${system}
+async function callOpenAICompat(model: string, system: string, messages: Msg[], schema: Schema, maxTokens: number, effort: Effort, strict: boolean): Promise<CallResult> {
+  const sys = strict ? system : `${system}
 
-FORMATO DI RISPOSTA: rispondi esclusivamente con un oggetto JSON valido, senza testo prima o dopo, che rispetti questo JSON Schema (tutti i campi "required" sono obbligatori):
+FORMATO DI RISPOSTA: rispondi solo con un oggetto JSON valido, senza testo prima o dopo, che rispetti questo JSON Schema (tutti i campi sono obbligatori):
 ${JSON.stringify(schema)}`;
+  const body: Record<string, unknown> = {
+    model, temperature: 0.75,
+    max_completion_tokens: maxTokens + (model.includes('gpt-oss') ? 1500 : 0),
+    messages: [{ role: 'system', content: sys }, ...messages],
+    response_format: strict
+      ? { type: 'json_schema', json_schema: { name: 'risposta', strict: true, schema } }
+      : { type: 'json_object' },
+  };
+  if (model.includes('gpt-oss')) { body.reasoning_effort = effort; body.include_reasoning = false; }
   const res = await fetch(`${BASE_URL}/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${API_KEY}` },
-    body: JSON.stringify({
-      model: MODEL, max_tokens: maxTokens, temperature: 0.8,
-      response_format: { type: 'json_object' },
-      messages: [{ role: 'system', content: sys }, ...messages],
-    }),
+    body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) return { status: res.status, error: data?.error?.message || `HTTP ${res.status}` };
   return { status: 200, text: data?.choices?.[0]?.message?.content || '' };
 }
 
-async function ai<T>(system: string, messages: Msg[], schema: Schema, opts: { maxTokens?: number; effort?: string } = {}): Promise<T> {
+const isModelError = (r: CallResult) =>
+  r.status === 404 || /does not exist|not have access|model_not_found|decommission|not found|not supported|unknown model/i.test(r.error || '');
+
+export async function ai<T>(system: string, messages: Msg[], schema: Schema, opts: { maxTokens?: number; effort?: Effort } = {}): Promise<T> {
   if (!API_KEY) throw new HttpError(500, 'Manca AI_API_KEY nei segreti della funzione Supabase');
+  if (!MODELS.length) throw new HttpError(500, 'Manca AI_MODEL nei segreti della funzione Supabase');
   const msgs = normalise(messages);
-  let lastErr = '';
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const r = PROVIDER === 'anthropic'
-      ? await callAnthropic(system, msgs, schema, opts.maxTokens ?? 3000, opts.effort ?? 'low')
-      : await callOpenAICompat(system, msgs, schema, opts.maxTokens ?? 1500);
-    if (r.status === 429 || r.status >= 500) {
-      lastErr = r.error || String(r.status);
-      await new Promise(res => setTimeout(res, 1200 * (attempt + 1)));
-      continue;
-    }
-    if (r.status !== 200) {
+  const maxTokens = opts.maxTokens ?? 1500, effort = opts.effort ?? 'low';
+  let lastErr = '', rateLimited = false;
+
+  for (const model of MODELS) {
+    if (unavailable.has(model)) continue;
+    let strict = PROVIDER === 'groq' && STRICT_SCHEMA.test(model);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const r = PROVIDER === 'anthropic'
+        ? await callAnthropic(model, system, msgs, schema, maxTokens, effort)
+        : await callOpenAICompat(model, system, msgs, schema, maxTokens, effort, strict);
+      if (r.status === 200) {
+        try { return parseJson(r.text || '') as T; }
+        catch { lastErr = 'risposta non in formato JSON'; continue; }
+      }
+      lastErr = `${model}: ${r.error}`;
       if (r.error === 'refusal') throw new HttpError(422, 'Selene ha preferito non rispondere a questo messaggio');
-      throw new HttpError(502, `AI: ${r.error}`);
+      if (isModelError(r)) { unavailable.add(model); break; }          // modello non accessibile → il prossimo
+      if (r.status === 429) { rateLimited = true; break; }             // quota finita → il prossimo
+      if (r.status === 400 && strict) { strict = false; continue; }    // schema rifiutato → JSON semplice
+      if (r.status >= 500 && attempt < 1) { await new Promise(res => setTimeout(res, 900)); continue; }
+      break;
     }
-    try { return parseJson(r.text || '') as T; }
-    catch { lastErr = 'risposta non in formato JSON'; }
   }
-  if (/rate|limit|quota/i.test(lastErr)) throw new HttpError(429, 'Selene è molto richiesta in questo momento: riprova tra un minuto');
-  throw new HttpError(502, `Selene non risponde (${lastErr}), riprova`);
+  console.error('ai failed', lastErr);
+  if (rateLimited) throw new HttpError(429, 'Selene ha esaurito le energie per oggi (quota gratuita dell’AI): riprova più tardi');
+  throw new HttpError(502, `Selene non risponde (${lastErr || 'nessun modello disponibile'}), riprova`);
 }
 
 const str = (v: unknown, fallback = '') => (typeof v === 'string' ? v.trim() : fallback);
+const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + '…' : s);
+
+// ── tempo ───────────────────────────────────────────────────────
+function romeToday(): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Rome', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+}
+function romeNow(): string {
+  return new Intl.DateTimeFormat('it-IT', { timeZone: 'Europe/Rome', weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' }).format(new Date());
+}
+function sinceText(iso: string): string {
+  const h = (Date.now() - new Date(iso).getTime()) / 3600000;
+  if (h < 1) return 'pochi minuti';
+  if (h < 24) return `${Math.round(h)} ore`;
+  const d = Math.round(h / 24);
+  return d === 1 ? 'un giorno' : `${d} giorni`;
+}
 
 // ── persona ─────────────────────────────────────────────────────
-const SELENE = `Sei Selene, la guida di PippiLove: un'app privata usata solo da una coppia sposata di adulti (due persone, in Italia) per esplorare e nutrire la propria sessualità.
-Il tuo approccio è quello di una sessuologa clinica esperta, calda e senza giudizio. Conosci il modello del doppio controllo (acceleratori e freni del desiderio), la differenza tra desiderio spontaneo e reattivo, l'importanza del contesto, della sicurezza emotiva, della novità, del gioco e della comunicazione.
+const SELENE = `Sei Selene, la guida di PippiLove: un'app privata usata solo da una coppia sposata di adulti in Italia per esplorare e nutrire la propria sessualità.
+Hai l'approccio di una sessuologa clinica esperta, calda e senza giudizio: conosci il modello del doppio controllo (acceleratori e freni del desiderio), il desiderio spontaneo e reattivo, l'importanza del contesto, della sicurezza emotiva, della novità, del gioco e della comunicazione.
 Non sei una terapeuta: se emergono dolore fisico, traumi, violenza, disfunzioni o sofferenza importante, accogli con delicatezza, non trasformarlo in gioco e suggerisci di parlarne con un medico o una/un sessuologa/o.
-Scrivi sempre in italiano, con tono intimo, elegante, ironico quando serve, mai volgare. Parli di sesso con naturalezza ma non scrivi descrizioni sessuali esplicite o grafiche: evochi, suggerisci, proponi.
-Consenso, rispetto dei limiti e parola di sicurezza vengono prima di tutto. Non spingi mai oltre un "no".
+Scrivi in italiano, con tono intimo, elegante, diretto, ironico quando serve, mai volgare e mai da questionario. Parli di sesso con naturalezza ma senza descrizioni esplicite o grafiche: evochi, suggerisci, proponi.
+Consenso, limiti e parola di sicurezza vengono prima di tutto. Non spingi mai oltre un "no".
 Ciò che una persona ti confida resta riservato: puoi usarlo per ispirare proposte, ma non riporti mai all'altra persona le sue parole o dettagli intimi riconoscibili.`;
 
 // ── dati ────────────────────────────────────────────────────────
@@ -127,8 +173,11 @@ type Ctx = {
   db: SupabaseClient; me: string; partner: string | null; couple: string | null;
   names: Record<string, string>; safeWord: string | null;
 };
+type Insight = { id: number; topic: string; note: string; shareable: boolean };
+type Checkin = { user_id?: string; day: string; mood?: number; energy?: number; stress?: number; desire?: number; time_tonight?: string; note?: string; wish?: string; updated_at?: string };
+type Person = { id: string; name: string; insights: Insight[]; checkins: Checkin[] };
 
-async function loadCtx(db: SupabaseClient, me: string): Promise<Ctx> {
+export async function loadCtx(db: SupabaseClient, me: string): Promise<Ctx> {
   const { data: prof } = await db.from('profiles').select('id, couple_id, display_name').eq('id', me).single();
   const ctx: Ctx = { db, me, partner: null, couple: prof?.couple_id ?? null, names: { [me]: prof?.display_name || 'Tu' }, safeWord: null };
   if (ctx.couple) {
@@ -142,74 +191,148 @@ async function loadCtx(db: SupabaseClient, me: string): Promise<Ctx> {
   return ctx;
 }
 
-type Checkin = { day: string; mood?: number; energy?: number; stress?: number; desire?: number; time_tonight?: string; note?: string; wish?: string; updated_at?: string };
-
-const fmtCheckin = (c: Checkin | undefined, withPrivate: boolean) => c
-  ? `umore ${c.mood ?? '?'}/5, energia ${c.energy ?? '?'}/5, stress ${c.stress ?? '?'}/5, voglia ${c.desire ?? '?'}/5${c.time_tonight ? `, tempo per noi stasera: ${c.time_tonight}` : ''}`
-    + (withPrivate && c.note ? `\n  com'è andata la giornata: ${c.note}` : '')
-    + (c.wish ? `\n  desiderio verso l'altro: ${c.wish}` : '')
-  : 'nessun check-in';
-
-async function personDossier(ctx: Ctx, id: string, opts: { forPartner: boolean }) {
-  const { db } = ctx;
+async function loadPerson(ctx: Ctx, id: string): Promise<Person> {
   const [ins, chk] = await Promise.all([
-    db.from('insights').select('topic, note, shareable').eq('user_id', id).order('id', { ascending: true }).limit(120),
-    db.from('checkins').select('*').eq('user_id', id).order('day', { ascending: false }).limit(5),
+    ctx.db.from('insights').select('id, topic, note, shareable').eq('user_id', id).order('id', { ascending: false }).limit(80),
+    ctx.db.from('checkins').select('*').eq('user_id', id).order('day', { ascending: false }).limit(5),
   ]);
-  const notes = (ins.data || []).filter(i => !opts.forPartner || i.shareable);
-  const limits = notes.filter(i => i.topic === 'limiti').map(i => `- ${i.note}`);
-  const other = notes.filter(i => i.topic !== 'limiti').map(i => `- [${i.topic}] ${i.note}`);
-  // i limiti si rispettano sempre, anche quelli segnati come privati
-  const hardLimits = (ins.data || []).filter(i => i.topic === 'limiti' && !i.shareable).length;
-  const checkins = ((chk.data || []) as Checkin[]).map(c => `- ${c.day}: ${fmtCheckin(c, !opts.forPartner)}`);
-  return [
-    `Nome: ${ctx.names[id]}`,
-    `LIMITI (non proporre mai nulla che li tocchi):\n${limits.join('\n') || '— nessuno dichiarato'}${hardLimits ? `\n(+ ${hardLimits} limiti riservati: resta su proposte delicate se hai dubbi)` : ''}`,
-    `Appunti di Selene dai colloqui:\n${other.join('\n') || '— ancora pochi'}`,
-    `Check-in recenti:\n${checkins.join('\n') || '—'}`,
-  ].join('\n');
+  return { id, name: ctx.names[id] || 'Partner', insights: ((ins.data || []) as Insight[]).reverse(), checkins: (chk.data || []) as Checkin[] };
 }
+
+const partnerLabel = (ctx: Ctx) => (ctx.partner ? ctx.names[ctx.partner] : 'il/la partner');
+
+// Ogni riga porta il nome del proprietario: così l'AI non confonde mai le due persone.
+function notesOf(p: Person, opts: { onlyShareable: boolean; max?: number; topics?: string[] }) {
+  const all = p.insights.filter(i => !opts.topics || opts.topics.includes(i.topic));
+  const limits = all.filter(i => i.topic === 'limiti');
+  const other = all.filter(i => i.topic !== 'limiti' && (!opts.onlyShareable || i.shareable)).slice(-(opts.max ?? 40));
+  const privateLimits = opts.onlyShareable ? limits.filter(i => !i.shareable).length : 0;
+  const shownLimits = opts.onlyShareable ? limits.filter(i => i.shareable) : limits;
+  return {
+    limits: shownLimits.map(i => `- [${p.name} · limite] ${i.note}`).join('\n')
+      + (privateLimits ? `\n- [${p.name}] ha anche ${privateLimits} limiti riservati: in caso di dubbio scegli la versione più delicata` : ''),
+    notes: other.map(i => `- [${p.name} · ${i.topic}] ${i.note}`).join('\n'),
+  };
+}
+
+const levels = (c: Checkin) =>
+  `umore ${c.mood ?? '?'}/5, energia ${c.energy ?? '?'}/5, stress ${c.stress ?? '?'}/5, voglia di intimità ${c.desire ?? '?'}/5${c.time_tonight ? `, tempo per voi stasera: ${c.time_tonight}` : ''}`;
+
+function checkinOwn(p: Person, c: Checkin | undefined) {
+  if (!c) return `${p.name} non ha ancora fatto il check-in di oggi.`;
+  return `${p.name} oggi: ${levels(c)}`
+    + (c.note ? `\n${p.name} racconta la sua giornata: "${clip(c.note, 700)}"` : '')
+    + (c.wish ? `\n${p.name} oggi vorrebbe ricevere da ${'{PARTNER}'}: "${clip(c.wish, 300)}"` : '');
+}
+
+// del partner arrivano solo i livelli e ciò che vorrebbe ricevere: mai il racconto privato della giornata
+function checkinPartner(p: Person, c: Checkin | undefined, other: string) {
+  if (!c) return `${p.name} oggi non ha ancora fatto il check-in.`;
+  return `${p.name} oggi: ${levels(c)}` + (c.wish ? `\n${p.name} oggi vorrebbe ricevere da ${other}: "${clip(c.wish, 300)}"` : '');
+}
+
+const todayOf = (p: Person) => p.checkins.find(c => c.day === romeToday());
 
 async function currentWeek(db: SupabaseClient): Promise<string> {
   const { data } = await db.rpc('current_week');
   return data as string;
 }
 
-function romeToday(): string {
-  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Rome', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+async function myPendingMission(ctx: Ctx) {
+  const week = await currentWeek(ctx.db);
+  const { data } = await ctx.db.from('challenges').select('ai_title, ai_text, status')
+    .eq('giver_id', ctx.me).eq('week_start', week).maybeSingle();
+  return data && data.status === 'pending' ? data : null;
 }
 
 const TOPICS = ['desiderio', 'acceleratori', 'freni', 'corpo', 'fantasie', 'limiti', 'comunicazione', 'emozioni', 'storia', 'contesto', 'coppia', 'preferenze'];
 
+function exploreMap(p: Person) {
+  const count: Record<string, number> = {};
+  for (const i of p.insights) count[i.topic] = (count[i.topic] || 0) + 1;
+  const done = TOPICS.filter(t => count[t]).map(t => `${t} (${count[t]})`);
+  const todo = TOPICS.filter(t => !count[t]);
+  return `Aree già esplorate: ${done.join(', ') || 'nessuna'}.\nAree ancora da esplorare: ${todo.join(', ') || 'nessuna: approfondisci dove senti più energia'}.`;
+}
+
 // ── colloquio ───────────────────────────────────────────────────
-const INTERVIEW_SCHEMA = {
+const INSIGHT_ITEM = {
   type: 'object',
   properties: {
-    reply: { type: 'string', description: 'Il tuo messaggio: breve (2-5 frasi), con UNA sola domanda finale.' },
-    new_insights: {
-      type: 'array',
-      description: 'Solo informazioni nuove emerse dall\'ultimo messaggio della persona (spesso 0-3).',
-      items: {
-        type: 'object',
-        properties: {
-          topic: { type: 'string', enum: TOPICS },
-          note: { type: 'string', description: 'Appunto sintetico in terza persona.' },
-          shareable: { type: 'boolean', description: 'false se la persona ha chiesto di tenerlo per sé o è troppo delicato per ispirare missioni.' },
-        },
-        required: ['topic', 'note', 'shareable'],
-        additionalProperties: false,
-      },
-    },
-    phase: { type: 'string', enum: ['accoglienza', 'storia', 'corpo', 'desiderio', 'freni', 'fantasie', 'comunicazione', 'coppia', 'oggi', 'chiusura'] },
-    progress: { type: 'integer', description: 'Quanto ti senti di conoscere la persona, da 0 a 100.' },
+    topic: { type: 'string', enum: TOPICS },
+    note: { type: 'string' },
+    shareable: { type: 'boolean' },
   },
-  required: ['reply', 'new_insights', 'phase', 'progress'],
+  required: ['topic', 'note', 'shareable'],
   additionalProperties: false,
 };
 
-type InterviewOut = { reply: string; new_insights: { topic: string; note: string; shareable: boolean }[]; phase: string; progress: number };
+const CHAT_SCHEMA = {
+  type: 'object',
+  properties: {
+    reply: { type: 'string' },
+    suggestions: { type: 'array', items: { type: 'string' } },
+    idea_text: { type: 'string' },
+    idea_kind: { type: 'string', enum: ['receive', 'give', 'together', 'none'] },
+    idea_intensity: { type: 'integer' },
+    new_insights: { type: 'array', items: INSIGHT_ITEM },
+    progress: { type: 'integer' },
+  },
+  required: ['reply', 'suggestions', 'idea_text', 'idea_kind', 'idea_intensity', 'new_insights', 'progress'],
+  additionalProperties: false,
+};
 
-async function interview(ctx: Ctx, message: string | undefined) {
+type ChatOut = {
+  reply: string; suggestions: string[]; idea_text: string; idea_kind: string; idea_intensity: number;
+  new_insights: { topic: string; note: string; shareable: boolean }[]; progress: number;
+};
+
+export function chatSystem(o: {
+  me: string; partner: string; mode: 'intro' | 'rientro' | 'risposta'; gap?: string; now: string;
+  checkin: string; mission: string; notes: string; limits: string; map: string; lastWasQuestionStreak: number;
+}) {
+  const { me, partner } = o;
+  return `${SELENE}
+
+STAI PARLANDO CON: ${me}. Dagli/dalle del tu. ${partner} è il/la partner: non è presente in questa chat, non conosci le sue confidenze e non devi mai attribuire a ${me} cose di ${partner}, né inventare cosa pensa o vuole ${partner}. Ogni dato qui sotto è etichettato con il nome della persona a cui si riferisce.
+Ora è ${o.now}.
+
+COME CONDUCI OGNI RISPOSTA
+1. Prima rispondi davvero a ciò che ${me} ha appena scritto: riprendi una sua parola o immagine precisa e mostra che hai colto anche ciò che sta sotto (emozione, bisogno, timore). Se ti fa una domanda o ti chiede un'idea, rispondi subito e concretamente: non rimandare con un'altra domanda.
+2. Poi scegli UNA mossa:
+   a) APPROFONDIRE: una sola domanda aperta e specifica che nasce da ciò che ha detto (un momento preciso, una sensazione nel corpo, cosa cambierebbe, cosa teme);
+   b) PROPORRE: un'idea concreta da vivere con ${partner} stasera o questa settimana, un piccolo esercizio o gioco di coppia, un modo per dire qualcosa a ${partner}, oppure una chiave di lettura da sessuologa applicata al suo caso.
+   Alterna le due mosse. ${o.lastWasQuestionStreak >= 2 ? 'Nelle ultime risposte hai fatto solo domande: QUESTA VOLTA PROPONI qualcosa di concreto (puoi chiudere con una domanda breve).' : 'Non fare più di due domande di fila senza proporre qualcosa.'}
+3. Adatta tutto a come sta oggi ${me} (check-in qui sotto): se è stanca/o, stressata/o o giù, proposte di cura, ascolto e contatto senza pressione; se ha energia e voglia, osa di più. Se non c'è il check-in e il momento è giusto, chiedi com'è andata la giornata.
+4. Usa la mappa dell'esplorazione: quando il discorso lo permette, porta con naturalezza verso un'area ancora poco esplorata.
+Lunghezza: 2-6 frasi. Più lungo solo se ti chiede un'idea o una spiegazione. Niente elenchi lunghi.
+
+${o.mode === 'intro' ? `PRIMO INCONTRO: presentati in 2-3 frasi, spiega che quello che ${me} ti dice resta riservato (lo userai per ispirare sorprese e missioni, senza mai riportare le sue parole a ${partner}; può dirti "questo tienilo per te") e fai una prima domanda leggera, legata a come sta oggi.` : ''}${o.mode === 'rientro' ? `${me} RIAPRE LA CHAT dopo ${o.gap}. Non ripetere l'ultima domanda: saluta in modo adatto al momento della giornata, riallacciati a com'è oggi (check-in, se c'è, altrimenti chiedi com'è andata) o alla missione in corso, e offri subito qualcosa: una piccola idea per oggi o una domanda nuova. Se c'era un filo rimasto in sospeso puoi richiamarlo in una frase.` : ''}
+
+CAMPI DA COMPILARE
+- reply: il tuo messaggio a ${me}.
+- suggestions: esattamente 3 risposte brevi (massimo 6 parole) che ${me} potrebbe toccare per continuare, scritte da ${me} in prima persona: una per approfondire, una per chiederti un'idea, una per parlare di oggi o cambiare argomento.
+- idea_text / idea_kind / idea_intensity: se nella reply proponi un'idea concreta che potrebbe diventare una missione, riscrivila qui in una frase in prima persona di ${me} (es. "Vorrei che mi preparassi un bagno caldo e restassi con me"). idea_kind: receive = ${partner} la fa per ${me}; give = ${me} la fa per ${partner}; together = insieme. idea_intensity: 1 dolce, 2 audace, 3 molto audace. L'app mostrerà un pulsante per metterla nella busta segreta. Se non proponi nulla: idea_text "", idea_kind "none", idea_intensity 1.
+- new_insights: SOLO informazioni nuove su ${me} emerse dal suo ultimo messaggio (spesso 0-3). Ogni nota inizia con il nome "${me}" (es. "${me} si accende quando…"). Se ${me} racconta qualcosa di ${partner}, scrivi "${me} percepisce che ${partner}…", mai come un fatto su ${partner}. topic "limiti" per ciò che non vuole fare o ricevere. shareable false se ${me} ha chiesto di tenerlo per sé o è troppo delicato per ispirare missioni.
+- progress: quanto senti di conoscere ${me}, da 0 a 100.
+
+MAPPA DELL'ESPLORAZIONE DI ${me.toUpperCase()}
+${o.map}
+
+OGGI
+${o.checkin}
+
+MISSIONE CHE ${me.toUpperCase()} STA FACENDO PER ${partner.toUpperCase()} QUESTA SETTIMANA
+${o.mission}
+
+LIMITI DI ${me.toUpperCase()}
+${o.limits || '— nessuno dichiarato'}
+
+COSA SAI GIÀ DI ${me.toUpperCase()}
+${o.notes || '— ancora poco: è l’inizio'}`;
+}
+
+export async function interview(ctx: Ctx, message: string | undefined) {
   const { db, me } = ctx;
   const since = new Date(Date.now() - 86400000).toISOString();
   const { count } = await db.from('interview_messages').select('id', { count: 'exact', head: true })
@@ -221,74 +344,77 @@ async function interview(ctx: Ctx, message: string | undefined) {
     if (text.length > 4000) throw new HttpError(400, 'Messaggio troppo lungo');
     await db.from('interview_messages').insert({ user_id: me, role: 'user', content: text });
   }
-  const { data: hist } = await db.from('interview_messages').select('role, content')
-    .eq('user_id', me).order('id', { ascending: false }).limit(40);
-  const history = ((hist || []) as Msg[]).reverse();
-  if (!text && history.length && history[history.length - 1].role === 'assistant') {
-    return { reply: history[history.length - 1].content, resumed: true };
+  const { data: hist } = await db.from('interview_messages').select('role, content, created_at')
+    .eq('user_id', me).order('id', { ascending: false }).limit(HISTORY);
+  const history = ((hist || []) as (Msg & { created_at: string })[]).reverse();
+  const last = history[history.length - 1];
+
+  let mode: 'intro' | 'rientro' | 'risposta' = 'risposta';
+  if (!text) {
+    if (!history.length) mode = 'intro';
+    else if (last.role === 'assistant') {
+      const hours = (Date.now() - new Date(last.created_at).getTime()) / 3600000;
+      if (hours < RESUME_HOURS) return { reply: last.content, resumed: true };
+      mode = 'rientro';
+    }
   }
 
-  const dossier = await personDossier(ctx, me, { forPartner: false });
-  const partnerName = ctx.partner ? ctx.names[ctx.partner] : 'il/la partner';
-  const first = history.length === 0 || (history.length === 1 && history[0].role === 'user' && !text);
-  const system = `${SELENE}
+  const meP = await loadPerson(ctx, me);
+  const partner = partnerLabel(ctx);
+  const { notes, limits } = notesOf(meP, { onlyShareable: false, max: 40 });
+  const mission = await myPendingMission(ctx);
+  // quante risposte consecutive di Selene finivano con una domanda
+  let streak = 0;
+  for (let i = history.length - 1; i >= 0 && streak < 3; i--) {
+    if (history[i].role !== 'assistant') continue;
+    if (/\?\s*$/.test(history[i].content)) streak++; else break;
+  }
 
-Stai facendo un colloquio individuale con ${ctx.names[me]} (partner: ${partnerName}). Lo scopo è conoscere a fondo la sua sessualità per creare poi missioni e consigli di coppia su misura.
-Conduci come una sessuologa in seduta:
-- una domanda alla volta, aperta e concreta, che parte da ciò che la persona ha appena detto;
-- prima di andare avanti rifletti in una frase ciò che hai capito, con calore;
-- chiedi esempi, sensazioni nel corpo, momenti precisi, il perché;
-- se la risposta è breve o vaga, approfondisci con gentilezza invece di cambiare argomento;
-- non proporre mai opzioni da scegliere né elenchi: lascia spazio alle sue parole;
-- esplora gradualmente: accoglienza → storia ed educazione → rapporto con il corpo → cosa accende il desiderio → cosa lo spegne → fantasie e curiosità → limiti → comunicazione e consenso → la coppia oggi;
-- tieni conto di come sta oggi (check-in): se è stanca/o o giù, vai piano;
-- se la persona è a disagio, rallenta; se vuole fermarsi, chiudi con dolcezza.
-${first ? 'È l\'inizio: presentati in poche righe, spiega che tutto resta riservato (userai ciò che dice solo per ispirare le missioni, senza mai riportare le sue parole a ' + partnerName + '; può dirti "questo tienilo per te") e fai la prima domanda, leggera.' : ''}
-In new_insights annota SOLO ciò che è emerso di nuovo nell'ultimo messaggio. Usa topic "limiti" per tutto ciò che non vuole fare o ricevere.
+  const system = chatSystem({
+    me: meP.name, partner, mode, gap: last ? sinceText(last.created_at) : '', now: romeNow(),
+    checkin: checkinOwn(meP, todayOf(meP)).replaceAll('{PARTNER}', partner),
+    mission: mission ? `"${mission.ai_title}": ${mission.ai_text}` : 'nessuna missione in corso',
+    notes, limits, map: exploreMap(meP), lastWasQuestionStreak: streak,
+  });
 
-Cosa sai già di ${ctx.names[me]}:
-${dossier}`;
+  const msgs: Msg[] = history.map(h => ({ role: h.role, content: clip(h.content, 1500) }));
+  if (mode === 'rientro') msgs.push({ role: 'user', content: `(${meP.name} ha appena riaperto la chat. Scrivi tu il primo messaggio.)` });
+  if (mode === 'intro') msgs.push({ role: 'user', content: `(${meP.name} apre la chat per la prima volta. Presentati.)` });
 
-  const out = await ai<InterviewOut>(system, history, INTERVIEW_SCHEMA, { maxTokens: 2500, effort: 'low' });
+  const out = await ai<ChatOut>(system, msgs, CHAT_SCHEMA, { maxTokens: 1400, effort: 'low' });
   const reply = str(out?.reply);
   if (!reply) throw new HttpError(502, 'Selene si è persa un attimo, riprova');
 
   await db.from('interview_messages').insert({ user_id: me, role: 'assistant', content: reply });
-  const fresh = (Array.isArray(out.new_insights) ? out.new_insights : [])
-    .filter(i => i && str(i.note))
-    .slice(0, 6)
-    .map(i => ({ user_id: me, topic: TOPICS.includes(i.topic) ? i.topic : 'preferenze', note: str(i.note), shareable: i.shareable !== false, source: 'interview' }));
+  const fresh = text
+    ? (Array.isArray(out.new_insights) ? out.new_insights : [])
+      .filter(i => i && str(i.note))
+      .slice(0, 5)
+      .map(i => ({ user_id: me, topic: TOPICS.includes(i.topic) ? i.topic : 'preferenze', note: clip(str(i.note), 400), shareable: i.shareable !== false, source: 'interview' }))
+    : [];
   if (fresh.length) await db.from('insights').insert(fresh);
 
-  // tieni la memoria ordinata
-  const { count: total } = await db.from('insights').select('id', { count: 'exact', head: true }).eq('user_id', me);
-  if ((total ?? 0) > CONSOLIDATE_OVER) {
+  if (meP.insights.length + fresh.length > CONSOLIDATE_OVER) {
     const job = consolidate(ctx).catch(e => console.error('consolidate', e));
     // deno-lint-ignore no-explicit-any
     const rt = (globalThis as any).EdgeRuntime;
     if (rt?.waitUntil) rt.waitUntil(job); else await job;
   }
 
-  return { reply, phase: str(out.phase), progress: Math.max(0, Math.min(100, Number(out.progress) | 0)), learned: fresh.length };
+  const kind = ['receive', 'give', 'together'].includes(out.idea_kind) ? out.idea_kind : null;
+  const ideaText = str(out.idea_text);
+  return {
+    reply,
+    suggestions: (Array.isArray(out.suggestions) ? out.suggestions : []).map(s => clip(str(s), 60)).filter(Boolean).slice(0, 3),
+    idea: kind && ideaText.length > 8 ? { text: clip(ideaText, 300), kind, intensity: Math.max(1, Math.min(3, Number(out.idea_intensity) | 0 || 1)) } : null,
+    progress: Math.max(0, Math.min(100, Number(out.progress) | 0)),
+    learned: fresh.length,
+  };
 }
 
 const CONSOLIDATE_SCHEMA = {
   type: 'object',
-  properties: {
-    notes: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          topic: { type: 'string', enum: TOPICS },
-          note: { type: 'string' },
-          shareable: { type: 'boolean' },
-        },
-        required: ['topic', 'note', 'shareable'],
-        additionalProperties: false,
-      },
-    },
-  },
+  properties: { notes: { type: 'array', items: INSIGHT_ITEM } },
   required: ['notes'],
   additionalProperties: false,
 };
@@ -297,10 +423,11 @@ async function consolidate(ctx: Ctx) {
   const { db, me } = ctx;
   const { data: rows } = await db.from('insights').select('id, topic, note, shareable').eq('user_id', me).order('id');
   if (!rows || rows.length <= CONSOLIDATE_OVER) return;
+  const name = ctx.names[me];
   const out = await ai<{ notes: { topic: string; note: string; shareable: boolean }[] }>(
-    `${SELENE}\n\nRiordina gli appunti su ${ctx.names[me]}: unisci i doppioni, tieni le informazioni più recenti quando si contraddicono, non inventare nulla, non perdere mai un limite. Massimo 35 appunti. Se uno degli appunti uniti era riservato (shareable false), anche il risultato lo è.`,
+    `${SELENE}\n\nRiordina gli appunti su ${name}: unisci i doppioni, tieni le informazioni più recenti quando si contraddicono, non inventare nulla, non perdere mai un limite. Massimo 30 appunti. Ogni nota inizia con "${name}". Se uno degli appunti uniti era riservato (shareable false), anche il risultato lo è.`,
     [{ role: 'user', content: rows.map(r => `- [${r.topic}] (${r.shareable ? 'condivisibile' : 'riservato'}) ${r.note}`).join('\n') }],
-    CONSOLIDATE_SCHEMA, { maxTokens: 4000, effort: 'medium' });
+    CONSOLIDATE_SCHEMA, { maxTokens: 3500, effort: 'low' });
   const notes = (out?.notes || []).filter(n => str(n.note));
   const limitsBefore = rows.filter(r => r.topic === 'limiti').length;
   const limitsAfter = notes.filter(n => n.topic === 'limiti').length;
@@ -315,64 +442,109 @@ async function consolidate(ctx: Ctx) {
 const MISSION_SCHEMA = {
   type: 'object',
   properties: {
-    title: { type: 'string', description: 'Titolo evocativo, 2-5 parole.' },
-    mission: { type: 'string', description: 'La missione, rivolta a chi la deve fare (seconda persona), 2-4 frasi concrete. Usa il nome di chi la riceve.' },
-    why: { type: 'string', description: 'Una frase per chi la fa: perché è pensata per l\'altra persona, senza citare confidenze.' },
+    chi_la_fa: { type: 'string' },
+    per_chi: { type: 'string' },
+    title: { type: 'string' },
+    mission: { type: 'string' },
+    why: { type: 'string' },
     category: { type: 'string', enum: ['romance', 'touch', 'tease', 'words', 'places', 'explore'] },
-    intensity: { type: 'integer', description: '1 dolce, 2 audace, 3 molto audace' },
-    proposal_id: { type: 'string', description: 'id della proposta personale usata, oppure stringa vuota' },
+    intensity: { type: 'integer' },
+    proposal_id: { type: 'string' },
   },
-  required: ['title', 'mission', 'why', 'category', 'intensity', 'proposal_id'],
+  required: ['chi_la_fa', 'per_chi', 'title', 'mission', 'why', 'category', 'intensity', 'proposal_id'],
   additionalProperties: false,
 };
 
-type Mission = { title: string; mission: string; why: string; category: string; intensity: number; proposal_id: string | null };
+type Mission = { chi_la_fa?: string; per_chi?: string; title: string; mission: string; why: string; category: string; intensity: number; proposal_id: string | null };
+type Proposal = { id: string; author_id: string; kind: string; body: string; intensity: number };
 
-async function createMission(ctx: Ctx, week: string, giver: string, receiver: string, extra = ''): Promise<Mission> {
-  const { db } = ctx;
-  const [recvDossier, giverDossier, props, hist] = await Promise.all([
-    personDossier(ctx, receiver, { forPartner: true }),
-    personDossier(ctx, giver, { forPartner: true }),
-    db.from('proposals').select('id, author_id, kind, body, intensity').eq('couple_id', ctx.couple!),
-    db.from('challenges').select('week_start, giver_id, ai_title, proposal_id, status, rating, feedback')
-      .eq('couple_id', ctx.couple!).order('week_start', { ascending: false }).limit(16),
-  ]);
-  const used = new Set((hist.data || []).filter(h => h.proposal_id && (h.status === 'done' || h.week_start === week)).map(h => h.proposal_id));
-  const eligible = (props.data || []).filter(p => !used.has(p.id) && (
-    (p.kind === 'receive' && p.author_id === receiver) || (p.kind === 'give' && p.author_id === giver) || p.kind === 'together'));
-  const doneCount = (hist.data || []).filter(h => h.status === 'done').length;
-  const level = Math.min(3, 1 + Math.floor(doneCount / 5));
-  const history = (hist.data || []).map(h =>
-    `- ${h.week_start} ${ctx.names[h.giver_id]} → ${h.ai_title || '(missione)'}: ${h.status === 'done' ? 'fatta' : 'in corso'}${h.rating ? `, voto ${h.rating}/5` : ''}${h.feedback ? `, commento: "${h.feedback}"` : ''}`);
-  const giverName = ctx.names[giver], recvName = ctx.names[receiver];
+export function missionPrompt(o: {
+  giver: Person; receiver: Person; week: string; level: number; safeWord: string | null;
+  proposals: Proposal[]; history: string[]; extra: string;
+}) {
+  const G = o.giver.name, R = o.receiver.name;
+  const recv = notesOf(o.receiver, { onlyShareable: true, max: 40 });
+  // di chi fa la missione servono solo limiti, energie e ciò che si è offerto di fare: NON i suoi desideri
+  const giv = notesOf(o.giver, { onlyShareable: true, max: 12, topics: ['limiti', 'comunicazione', 'contesto'] });
+  const recvWishes = o.receiver.checkins.filter(c => c.wish).slice(0, 3).map(c => `- ${c.day}: ${R} vorrebbe ricevere da ${G}: "${clip(c.wish!, 200)}"`);
+  const recvLevels = o.receiver.checkins.slice(0, 3).map(c => `- ${c.day}: ${levels(c)}`);
+  const givLevels = o.giver.checkins.slice(0, 3).map(c => `- ${c.day}: ${levels(c)}`);
+  const propLine = (p: Proposal) => {
+    const who = p.author_id === o.receiver.id ? R : G;
+    const what = p.kind === 'receive' ? `${who} vorrebbe RICEVERE da ${who === R ? G : R}` : p.kind === 'give' ? `${who} vorrebbe FARE per ${who === R ? G : R}` : `${who} vorrebbe fare INSIEME`;
+    return `- id ${p.id} · ${what} (intensità ${p.intensity}): "${clip(p.body, 300)}"`;
+  };
 
   const system = `${SELENE}
 
-Ogni settimana crei UNA missione: qualcosa che ${giverName} farà per ${recvName}. ${recvName} non saprà cosa sarà finché non sarà fatta.
+COMPITO: scrivi UNA missione settimanale.
+- CHI LA FA: ${G}. Il testo è rivolto a ${G}, con il tu.
+- PER CHI: ${R}. La missione deve far stare bene ${R} e nutrire ciò che accende ${R}. ${R} non saprà cosa sarà finché non sarà fatta.
+Attenzione a non invertire i ruoli: i desideri da soddisfare sono quelli di ${R}, non quelli di ${G}.
+
 Regole:
-- Deve nutrire ciò che accende ${recvName} (desideri, acceleratori, bisogni emotivi, check-in recenti) ed essere qualcosa che ${giverName} può fare volentieri.
-- MAI proporre qualcosa che tocchi i LIMITI di uno dei due.
-- Livello attuale della coppia: ${level}/3. Scendi se i check-in raccontano stanchezza o stress; sali solo se entrambi sembrano pronti.
-- Concreta, realizzabile in una settimana, originale e personale. Varia rispetto alle ultime settimane; tieni conto dei voti (riprendi lo spirito di ciò che è piaciuto, evita ciò che ha preso voti bassi).
-- Se c'è una proposta personale adatta, puoi costruire la missione su di essa (priorità alle proposte "receive" scritte da ${recvName}): in quel caso metti il suo id in proposal_id e rispettane il contenuto. Altrimenti proposal_id = "".
+- Basati su "COSA ACCENDE ${R.toUpperCase()}" e su ciò che ${R} vorrebbe ricevere. Di ${G} considera solo limiti ed energie, per proporre qualcosa che ${G} possa fare volentieri.
+- MAI nulla che tocchi i limiti di ${R} o di ${G}.
+- Livello attuale della coppia: ${o.level}/3. Scendi se i check-in recenti raccontano stanchezza o stress; sali solo se entrambi sembrano pronti.
+- Concreta, realizzabile in una settimana, originale e personale. Varia rispetto alle ultime settimane; riprendi lo spirito di ciò che ha preso voti alti, evita ciò che ha preso voti bassi.
+- Se una proposta della busta segreta in cui ${R} vuole ricevere (o in cui ${G} vuole fare, o da fare insieme) è adatta, puoi costruirci la missione: metti il suo id in proposal_id e rispettane il contenuto. Altrimenti proposal_id = "".
 - Non citare mai confidenze o parole dei colloqui: trasformale in un'idea.
-${ctx.safeWord ? `- Se la missione è audace, ricorda la parola di sicurezza della coppia: "${ctx.safeWord}".` : '- Se la missione è audace, ricorda di concordare prima una parola di sicurezza.'}`;
+- ${o.safeWord ? `Se la missione è audace, ricorda la parola di sicurezza della coppia: "${o.safeWord}".` : 'Se la missione è audace, ricorda di concordare prima una parola di sicurezza.'}
 
-  const user = `CHI RICEVE — ${recvName}
-${recvDossier}
+Campi: chi_la_fa = "${G}", per_chi = "${R}", title (2-5 parole, evocativo), mission (2-4 frasi concrete rivolte a ${G}, usando il nome ${R}), why (una frase per ${G}: perché è pensata per ${R}, senza citare confidenze), category, intensity (1 dolce, 2 audace, 3 molto audace), proposal_id.`;
 
-CHI FA — ${giverName}
-${giverDossier}
+  const user = `COSA ACCENDE ${R.toUpperCase()} (appunti di Selene su ${R}):
+${recv.notes || '— ancora pochi'}
 
-PROPOSTE PERSONALI DISPONIBILI:
-${eligible.map(p => `- id ${p.id} · scritta da ${ctx.names[p.author_id]} · tipo ${p.kind} · intensità ${p.intensity}: "${p.body}"`).join('\n') || '—'}
+COSA ${R.toUpperCase()} HA CHIESTO DI RECENTE NEI CHECK-IN:
+${recvWishes.join('\n') || '—'}
 
-STORICO RECENTE:
-${history.join('\n') || '— (prima settimana)'}
-${extra}
-Scrivi la missione della settimana del ${week} per ${giverName}.`;
+LIMITI DI ${R.toUpperCase()}:
+${recv.limits || '— nessuno dichiarato'}
 
-  const m = await ai<Mission>(system, [{ role: 'user', content: user }], MISSION_SCHEMA, { maxTokens: 3000, effort: 'medium' });
+LIMITI E CONTESTO DI ${G.toUpperCase()} (chi fa la missione):
+${[giv.limits, giv.notes].filter(Boolean).join('\n') || '— nessuno dichiarato'}
+
+COME STANNO DI RECENTE
+${recvLevels.length ? recvLevels.map(l => `${R} ${l.slice(2)}`).map(l => '- ' + l).join('\n') : `- ${R}: nessun check-in`}
+${givLevels.length ? givLevels.map(l => `${G} ${l.slice(2)}`).map(l => '- ' + l).join('\n') : `- ${G}: nessun check-in`}
+
+BUSTA SEGRETA (proposte scritte da loro):
+${o.proposals.map(propLine).join('\n') || '—'}
+
+STORICO RECENTE DELLE MISSIONI:
+${o.history.join('\n') || '— (prima settimana)'}
+${o.extra}
+Scrivi la missione della settimana del ${o.week}: ${G} la fa per ${R}.`;
+  return { system, user };
+}
+
+async function createMission(ctx: Ctx, week: string, giverId: string, receiverId: string, extra = ''): Promise<Mission> {
+  const { db } = ctx;
+  const [giver, receiver, props, hist] = await Promise.all([
+    loadPerson(ctx, giverId),
+    loadPerson(ctx, receiverId),
+    db.from('proposals').select('id, author_id, kind, body, intensity').eq('couple_id', ctx.couple!),
+    db.from('challenges').select('week_start, giver_id, receiver_id, ai_title, proposal_id, status, rating, feedback')
+      .eq('couple_id', ctx.couple!).order('week_start', { ascending: false }).limit(16),
+  ]);
+  const used = new Set((hist.data || []).filter(h => h.proposal_id && (h.status === 'done' || h.week_start === week)).map(h => h.proposal_id));
+  const eligible = ((props.data || []) as Proposal[]).filter(p => !used.has(p.id) && (
+    (p.kind === 'receive' && p.author_id === receiverId) || (p.kind === 'give' && p.author_id === giverId) || p.kind === 'together'));
+  const doneCount = (hist.data || []).filter(h => h.status === 'done').length;
+  const level = Math.min(3, 1 + Math.floor(doneCount / 5));
+  const history = (hist.data || []).map(h =>
+    `- ${h.week_start} · ${ctx.names[h.giver_id]} per ${ctx.names[h.receiver_id]}: "${h.ai_title || 'missione'}" — ${h.status === 'done' ? 'fatta' : 'in corso'}${h.rating ? `, voto di ${ctx.names[h.receiver_id]}: ${h.rating}/5` : ''}${h.feedback ? `, commento: "${clip(h.feedback, 160)}"` : ''}`);
+
+  const { system, user } = missionPrompt({ giver, receiver, week, level, safeWord: ctx.safeWord, proposals: eligible, history, extra });
+  let m = await ai<Mission>(system, [{ role: 'user', content: user }], MISSION_SCHEMA, { maxTokens: 1500, effort: 'medium' });
+  // controllo dei ruoli: se l'AI li ha invertiti, si riprova una volta
+  const swapped = (x: Mission) => str(x.per_chi).toLowerCase() === giver.name.toLowerCase() || str(x.chi_la_fa).toLowerCase() === receiver.name.toLowerCase();
+  if (swapped(m)) {
+    m = await ai<Mission>(system, [{ role: 'user', content: user },
+      { role: 'assistant', content: JSON.stringify(m) },
+      { role: 'user', content: `Hai invertito i ruoli: la missione la fa ${giver.name} PER ${receiver.name}. Riscrivila.` }], MISSION_SCHEMA, { maxTokens: 1500, effort: 'medium' });
+  }
   if (!str(m?.title) || !str(m?.mission)) throw new HttpError(502, 'Missione non valida, riprova');
   m.title = str(m.title); m.mission = str(m.mission); m.why = str(m.why);
   m.intensity = Math.max(1, Math.min(3, Number(m.intensity) | 0 || 1));
@@ -394,14 +566,13 @@ async function readiness(ctx: Ctx) {
   return counts.every(c => c >= MIN_INSIGHTS);
 }
 
-async function draw(ctx: Ctx) {
+export async function draw(ctx: Ctx) {
   if (!ctx.couple || !ctx.partner) return { ok: false, reason: 'partner' };
   if (!(await readiness(ctx))) return { ok: false, reason: 'colloquio' };
   const week = await currentWeek(ctx.db);
   const { data: existing } = await ctx.db.from('challenges').select('giver_id').eq('couple_id', ctx.couple).eq('week_start', week);
   const have = new Set((existing || []).map(e => e.giver_id));
   const pairs = [[ctx.me, ctx.partner], [ctx.partner, ctx.me]].filter(([g]) => !have.has(g));
-  // le due missioni una dopo l'altra, così la seconda sa qual è la prima
   for (const [giver, receiver] of pairs) {
     const { data: other } = await ctx.db.from('challenges').select('ai_title').eq('couple_id', ctx.couple).eq('week_start', week).neq('giver_id', giver).maybeSingle();
     const m = await createMission(ctx, week, giver, receiver, other?.ai_title ? `\nL'altra missione di questa settimana è "${other.ai_title}": proponi qualcosa di diverso.\n` : '');
@@ -414,7 +585,7 @@ async function draw(ctx: Ctx) {
   return { ok: true };
 }
 
-async function reroll(ctx: Ctx, challengeId: string, reason: string | undefined) {
+export async function reroll(ctx: Ctx, challengeId: string, reason: string | undefined) {
   const { data: ch } = await ctx.db.from('challenges').select('*').eq('id', challengeId).single();
   if (!ch || ch.giver_id !== ctx.me || ch.status !== 'pending') throw new HttpError(404, 'Missione non trovata');
   if (ch.rerolls >= 2) throw new HttpError(400, 'Hai già cambiato missione 2 volte questa settimana');
@@ -433,61 +604,81 @@ async function reroll(ctx: Ctx, challengeId: string, reason: string | undefined)
 const TODAY_SCHEMA = {
   type: 'object',
   properties: {
-    headline: { type: 'string', description: 'Titolo breve e caldo per oggi.' },
-    reading: { type: 'string', description: '1-2 frasi: come leggi la giornata della persona e il clima di coppia, con empatia.' },
-    gesture: { type: 'string', description: 'Un piccolo gesto concreto da fare oggi per il/la partner.' },
-    mission_tip: { type: 'string', description: 'Se c\'è una missione in corso: se e come portarla avanti oggi, adattandola a come stanno entrambi. Altrimenti stringa vuota.' },
-    self_care: { type: 'string', description: 'Un suggerimento per sé, per accendere o proteggere il proprio desiderio oggi.' },
-    question: { type: 'string', description: 'Una domanda da fare al/la partner stasera.' },
-    mood_color: { type: 'string', enum: ['quiete', 'tenerezza', 'gioco', 'passione', 'cura'], description: 'Il tono della giornata, usato per i colori dell\'app.' },
+    per_chi: { type: 'string' },
+    headline: { type: 'string' },
+    reading: { type: 'string' },
+    gesture: { type: 'string' },
+    mission_tip: { type: 'string' },
+    self_care: { type: 'string' },
+    question: { type: 'string' },
+    mood_color: { type: 'string', enum: ['quiete', 'tenerezza', 'gioco', 'passione', 'cura'] },
   },
-  required: ['headline', 'reading', 'gesture', 'mission_tip', 'self_care', 'question', 'mood_color'],
+  required: ['per_chi', 'headline', 'reading', 'gesture', 'mission_tip', 'self_care', 'question', 'mood_color'],
   additionalProperties: false,
 };
 
-async function today(ctx: Ctx, force: boolean) {
+export function todayPrompt(o: { me: Person; partner: Person | null; mineToday: Checkin; theirsToday?: Checkin; mission: string; now: string }) {
+  const M = o.me.name, P = o.partner?.name || 'il/la partner';
+  const mine = notesOf(o.me, { onlyShareable: false, max: 25 });
+  const theirs = o.partner ? notesOf(o.partner, { onlyShareable: true, max: 20 }) : { notes: '', limits: '' };
+  const system = `${SELENE}
+
+Scrivi il consiglio di oggi PER ${M} (dagli/dalle del tu). ${P} è il/la partner.
+Non confondere mai le due persone: ciò che è etichettato "${M}" riguarda ${M}, ciò che è etichettato "${P}" riguarda ${P}. La giornata raccontata è quella di ${M}. Di ${P} conosci solo i livelli di oggi e ciò che vorrebbe ricevere: non inventare cosa le/gli è successo.
+Obiettivo: aiutare ${M} a vivere la giornata in modo da nutrire l'intimità con ${P}, partendo da come stanno entrambi OGGI.
+Se uno dei due è stanco, stressato o giù, proponi calore, ascolto e contatto senza pressione. Se l'energia c'è, osa di più.
+Ciò che ${P} vorrebbe ricevere puoi tradurlo in un gesto concreto per ${M}, senza dire che ${P} l'ha scritto.
+Sii specifica, breve, mai generica. Niente elenchi.
+
+Campi: per_chi = "${M}"; headline (titolo breve e caldo); reading (1-2 frasi: come leggi la giornata di ${M} e il clima tra voi); gesture (un piccolo gesto concreto che ${M} può fare oggi per ${P}); mission_tip (se ${M} ha una missione in corso: se e come portarla avanti oggi; altrimenti ""); self_care (un suggerimento per ${M}, per accendere o proteggere il proprio desiderio oggi); question (una domanda che ${M} può fare a ${P} stasera); mood_color.`;
+
+  const user = `ORA: ${o.now}
+
+${M.toUpperCase()} — LA PERSONA A CUI SCRIVI
+${checkinOwn(o.me, o.mineToday).replaceAll('{PARTNER}', P)}
+Limiti di ${M}:
+${mine.limits || '—'}
+Appunti su ${M}:
+${mine.notes || '—'}
+
+${P.toUpperCase()} — IL/LA PARTNER
+${o.partner ? checkinPartner(o.partner, o.theirsToday, M) : '—'}
+Limiti di ${P}:
+${theirs.limits || '—'}
+Cosa accende ${P}:
+${theirs.notes || '—'}
+
+MISSIONE CHE ${M.toUpperCase()} STA FACENDO PER ${P.toUpperCase()}:
+${o.mission}`;
+  return { system, user };
+}
+
+export async function today(ctx: Ctx, force: boolean) {
   const { db, me, partner } = ctx;
   const day = romeToday();
   const ids = [me, partner].filter(Boolean) as string[];
   const { data: chks } = await db.from('checkins').select('*').eq('day', day).in('user_id', ids);
-  const mine = (chks || []).find(c => c.user_id === me) as Checkin | undefined;
-  if (!mine) throw new HttpError(400, 'Prima raccontami come stai oggi');
-  const theirs = (chks || []).find(c => c.user_id === partner) as Checkin | undefined;
-  const basis = `${mine.updated_at}|${theirs?.updated_at ?? ''}`;
+  const mineToday = (chks || []).find(c => c.user_id === me) as Checkin | undefined;
+  if (!mineToday) throw new HttpError(400, 'Prima raccontami come stai oggi');
+  const theirsToday = (chks || []).find(c => c.user_id === partner) as Checkin | undefined;
+  const basis = `v2|${mineToday.updated_at}|${theirsToday?.updated_at ?? ''}`;
 
   if (!force) {
     const { data: cached } = await db.from('daily_tips').select('content, basis').eq('user_id', me).eq('day', day).maybeSingle();
     if (cached && cached.basis === basis) return cached.content;
   }
 
-  const week = await currentWeek(db);
-  const { data: ch } = await db.from('challenges').select('ai_title, ai_text, status')
-    .eq('giver_id', me).eq('week_start', week).maybeSingle();
-  const myName = ctx.names[me], pName = partner ? ctx.names[partner] : 'il/la partner';
+  const [meP, partnerP, mission] = await Promise.all([
+    loadPerson(ctx, me),
+    partner ? loadPerson(ctx, partner) : Promise.resolve(null),
+    myPendingMission(ctx),
+  ]);
+  const { system, user } = todayPrompt({
+    me: meP, partner: partnerP, mineToday, theirsToday, now: romeNow(),
+    mission: mission ? `"${mission.ai_title}": ${mission.ai_text}` : 'nessuna in corso',
+  });
 
-  const system = `${SELENE}
-
-Oggi aiuti ${myName} a vivere la giornata in modo da nutrire l'intimità con ${pName}, partendo da come stanno entrambi OGGI e da ciò che è successo.
-Il check-in di ${pName} ti serve per capire come starle/gli vicino: non citare le sue parole né dettagli privati; al massimo indicazioni di tono ("oggi meglio la dolcezza"). Il suo "desiderio verso l'altro" invece puoi tradurlo in un suggerimento concreto, senza dire che l'ha scritto.
-Se uno dei due è stanco, stressato o giù, proponi calore, ascolto e contatto senza pressione: il desiderio nasce dal contesto giusto. Se l'energia c'è, osa di più.
-Sii specifica, breve, mai generica. Niente elenchi.`;
-
-  const user = `${myName.toUpperCase()} OGGI (${day}):
-${fmtCheckin(mine, true)}
-
-${pName.toUpperCase()} OGGI:
-${theirs ? fmtCheckin(theirs, true) : 'non ha ancora fatto il check-in'}
-
-CHI È ${myName}:
-${await personDossier(ctx, me, { forPartner: false })}
-
-CHI È ${pName}:
-${partner ? await personDossier(ctx, partner, { forPartner: true }) : '—'}
-
-MISSIONE DI ${myName} PER ${pName} QUESTA SETTIMANA:
-${ch && ch.status === 'pending' ? `${ch.ai_title} — ${ch.ai_text}` : 'nessuna in corso'}`;
-
-  const out = await ai<Record<string, unknown>>(system, [{ role: 'user', content: user }], TODAY_SCHEMA, { maxTokens: 2500, effort: 'low' });
+  const out = await ai<Record<string, unknown>>(system, [{ role: 'user', content: user }], TODAY_SCHEMA, { maxTokens: 1200, effort: 'low' });
   const clean = {
     headline: str(out.headline, 'Oggi'), reading: str(out.reading), gesture: str(out.gesture),
     mission_tip: str(out.mission_tip) || null, self_care: str(out.self_care), question: str(out.question),
@@ -498,7 +689,8 @@ ${ch && ch.status === 'pending' ? `${ch.ai_title} — ${ch.ai_text}` : 'nessuna 
 }
 
 // ── server ──────────────────────────────────────────────────────
-Deno.serve(async (req) => {
+// (PIPPI_TEST serve solo ai test locali dei prompt)
+if (!Deno.env.get('PIPPI_TEST')) Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS });
   try {
     const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!, { auth: { persistSession: false } });
@@ -517,7 +709,7 @@ Deno.serve(async (req) => {
       case 'draw': return json(await draw(ctx));
       case 'reroll': return json(await reroll(ctx, body.challenge_id, body.reason));
       case 'today': return json(await today(ctx, !!body.force));
-      case 'ping': return json({ ok: true, provider: PROVIDER, model: MODEL, key: !!API_KEY });
+      case 'ping': return json({ ok: true, provider: PROVIDER, models: MODELS, unavailable: [...unavailable], key: !!API_KEY });
       default: throw new HttpError(400, 'Azione sconosciuta');
     }
   } catch (e) {
