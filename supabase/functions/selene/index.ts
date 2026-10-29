@@ -60,7 +60,8 @@ function normalise(messages: Msg[]): Msg[] {
 }
 
 function parseJson(text: string): unknown {
-  const t = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+  // alcuni modelli (es. Qwen) possono anteporre il ragionamento tra <think>…</think>
+  const t = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
   try { return JSON.parse(t); } catch { /* prova a isolare l'oggetto */ }
   const a = t.indexOf('{'), b = t.lastIndexOf('}');
   if (a >= 0 && b > a) return JSON.parse(t.slice(a, b + 1));
@@ -97,6 +98,7 @@ ${JSON.stringify(schema)}`;
       : { type: 'json_object' },
   };
   if (model.includes('gpt-oss')) { body.reasoning_effort = effort; body.include_reasoning = false; }
+  else if (/qwen3/i.test(model)) { body.reasoning_effort = effort; body.reasoning_format = 'hidden'; }
   const res = await fetch(`${BASE_URL}/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${API_KEY}` },
